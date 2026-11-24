@@ -736,6 +736,14 @@ function tipiHectorApply(string $d,array $command,string $token): array {
     });
 }
 function tipiHectorRun(string $d,array $cfg,?callable $request=null): array {
+    $lock=fopen($d.'/hector-run.lock','c');
+    if(!$lock)fail('Verrou Hector indisponible',500);
+    try{
+        if(!flock($lock,LOCK_EX|LOCK_NB))fail('Un traitement Hector est déjà en cours',409);
+        return tipiHectorRunLocked($d,$cfg,$request);
+    }finally{flock($lock,LOCK_UN);fclose($lock);}
+}
+function tipiHectorRunLocked(string $d,array $cfg,?callable $request=null): array {
     $request=$request??'tipiHubRequest';$h=tipiHubConfig($d);
     if(empty($h['access_token']))fail('Connectez d’abord le site',409);
     // Sync every run, even if editorial writes are disabled.
@@ -743,18 +751,34 @@ function tipiHectorRun(string $d,array $cfg,?callable $request=null): array {
     if(empty($h['hector_write']))return ['inventory'=>$sync,'command'=>null];
     $token=$h['access_token'];$headers=['Authorization: Bearer '.$token];
     $context=['site_url'=>$cfg['url'],'installation_uid'=>$h['installation_uid']];
+    // An acknowledgement lost in transit must survive even after the command expires.
+    $pendingFile=$d.'/hector-pending-ack.json';
+    $pending=jread($pendingFile);
+    if(($pending['binding']??'')===hash('sha256',$token)&&is_array($pending['receipt']??null)){
+        $receipt=$pending['receipt'];
+        $ack=$request('POST','hector/cms/commands',$context+['receipt'=>$receipt],$headers)['commands']??[];
+        if(($ack['acknowledged']??null)!==$receipt['id'])fail('Accusé de réception Hector manquant',502);
+        // Retain the file: its exact receipt can safely be retried. Replace it with
+        // an empty record atomically rather than unlinking across concurrent runs.
+        locked($d,function()use($pendingFile,$pending){if(jread($pendingFile)===$pending)jwrite($pendingFile,[]);});
+        return ['inventory'=>$sync,'command'=>$receipt];
+    }
     $command=$request('POST','hector/cms/commands',$context,$headers)['commands']['command']??null;
     if($command===null)return ['inventory'=>$sync,'command'=>null];
     if(!is_array($command))fail('Commande Hector invalide',502);
     try{$receipt=tipiHectorApply($d,$command,$token);}
     catch(RuntimeException $ex){
-        if(!in_array($ex->getCode(),[409,422],true))throw $ex;
+        if(!in_array($ex->getCode(),[400,409,422],true))throw $ex;
         $receipt=['id'=>$command['id']??'','status'=>'rejected','reason'=>$ex->getCode()===409?'conflict':'invalid'];
     }
+    // Persist acknowledgement before the next network call.
+    $pending=['binding'=>hash('sha256',$token),'receipt'=>$receipt];
+    locked($d,fn()=>jwrite($pendingFile,$pending));
     // Confirm the new published snapshot before acknowledging success.
     if($receipt['status']==='applied')$sync=tipiHectorSync($d,$cfg,$request);
     $ack=$request('POST','hector/cms/commands',$context+['receipt'=>$receipt],$headers)['commands']??[];
     if(($ack['acknowledged']??null)!==$receipt['id'])fail('Accusé de réception Hector manquant',502);
+    locked($d,function()use($pendingFile,$pending){if(jread($pendingFile)===$pending)jwrite($pendingFile,[]);});
     return ['inventory'=>$sync,'command'=>$receipt];
 }
 function tipiHubEnabled(array $h): bool {return ($h['analytics']??false)===true&&is_string($h['tracker_key']??null)&&preg_match('~^[a-zA-Z0-9_-]{16,128}$~D',$h['tracker_key'])===1;}
