@@ -119,7 +119,20 @@ grep -q '/assets/js/animation.js' "$TMP/home-html"
 curl -fsS "$BASE/assets/js/animation.js" | grep -q 'DOMContentLoaded'
 curl -fsS -H "Cookie: $COOKIE" "$BASE/admin" >"$TMP/admin-html"
 if grep -q '/assets/js/animation.js' "$TMP/admin-html"; then exit 1; fi
-echo 'OAuth MCP, shared contacts, reviewed HTML/CSS/JS patch OK'
+# Native tracking survives the custom HTML layout, without external requests in this test.
+curl -fsS -H "Cookie: $COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=hub_save' --data-urlencode 'tracker_key=isolated-test-key-not-live-123' --data-urlencode 'analytics=1' "$BASE/admin" >/dev/null
+BIND=$(php -r '$h=json_decode(file_get_contents(getenv("TIPI_DATA_DIR")."/hub.json"),true);echo substr(hash("sha256",$h["installation_uid"]."|".$h["consent_epoch"]."|".$h["tracker_key"]."|0"),0,32);')
+curl -fsS -H "Cookie: tipi_metrics_consent=$BIND.yes" "$BASE/" >"$TMP/custom-tracking"
+grep -q 'custom-layout' "$TMP/custom-tracking"
+test "$(grep -o 'analitycs.le-tipi.club/tracker.js' "$TMP/custom-tracking" | wc -l)" = 1
+if grep -q 'optimize.le-tipi.club/optimize.js' "$TMP/custom-tracking"; then exit 1; fi
+curl -fsS -H "Cookie: $COOKIE; tipi_metrics_consent=$BIND.yes" "$BASE/admin?preview=home" >"$TMP/private-tracking"
+if grep -q 'analitycs.le-tipi.club/tracker.js' "$TMP/private-tracking"; then exit 1; fi
+rpc '{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"cms_tracking_info","arguments":{}}}' >"$TMP/tracking-status"
+grep -q 'explicit_opt_in' "$TMP/tracking-status"
+if grep -q 'isolated-test-key-not-live-123' "$TMP/tracking-status"; then exit 1; fi
+curl -fsS -H "Cookie: $COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=hub_disconnect' "$BASE/admin" >/dev/null
+echo 'OAuth MCP, shared contacts, reviewed HTML/CSS/JS patch and native tracking OK'
 
 # V0.6: owner selects approval policy once; same OAuth client deploys and restores.
 test "$(curl -fsS -H "Cookie: $COOKIE" "$BASE/admin?connections=1" | grep -c 'Validation des développements')" -ge 1
