@@ -615,7 +615,12 @@ function admin(string $d,array $cfg): void {
             if(!is_file($bridge)||is_link($bridge))fail('CodeGraft non installé',409);
             require_once $bridge;
             locked($d,function()use($d){$c=jread($d.'/config.json');$c['business_read']=isset($_POST['business_read']);$c['business_write']=$c['business_read']&&isset($_POST['business_write']);
-                if(isset($_POST['business_approve']))$c['business_approved']=tipiBusinessManifest(dirname(__DIR__));
+                if(isset($_POST['business_approve'])){
+                    $manifest=tipiBusinessManifest(dirname(__DIR__));
+                    $fingerprint=hash('sha256',json_encode($manifest,JSON_THROW_ON_ERROR));
+                    if(!hash_equals($fingerprint,(string)($_POST['business_fingerprint']??'')))fail('Les modules ont changé : rechargez et vérifiez les nouvelles versions',409);
+                    $c['business_approved']=$manifest;
+                }
                 if(isset($_POST['business_clear'])){$c['business_approved']=[];$c['business_read']=false;$c['business_write']=false;}
                 jwrite($d.'/config.json',$c);});
             redirect('/admin?connections=1');
@@ -654,8 +659,20 @@ function admin(string $d,array $cfg): void {
         shell('Apparence',$body,'',$nav);return;
     }
     if(isset($_GET['connections'])){
-        $bridge=is_file(dirname(__DIR__).'/tipi-system/bridge.php');
-        $business='<h2>CodeGraft et applications métier</h2>'.($bridge?'<p>Passerelle OAuth installée : <code>'.e($cfg['url'].'/codegraft-api/').'</code></p><p><a href="/codegraft/standalone/admin.php">Ouvrir les permissions CodeGraft</a></p><form method="post">'.csrf().'<label><input type="checkbox" style="width:auto;display:inline" name="business_read" '.(!empty($cfg['business_read'])?'checked':'').'> Activer les actions métier déclarées (lecture)</label><label><input type="checkbox" style="width:auto;display:inline" name="business_write" '.(!empty($cfg['business_write'])?'checked':'').'> Autoriser les écritures métier</label><label><input type="checkbox" style="width:auto;display:inline" name="business_approve"> Approuver les versions PHP actuellement présentes dans app/McpActions (uniquement après revue du patch)</label><label><input type="checkbox" style="width:auto;display:inline" name="business_clear"> Révoquer toutes les approbations</label><button name="action" value="business_policy">Enregistrer</button></form><p>Le code PHP approuvé est exécuté avec les droits du compte hébergeur : ce n’est pas une sandbox.</p>':'<p>Option non installée. Voir scripts/install-codegraft.sh.</p>');
+        $system=dirname(__DIR__).'/tipi-system';
+        $bridge=is_file($system.'/bridge.php')&&is_file($system.'/codegraft/standalone/config.php');
+        $moduleView='';
+        if($bridge){
+            require_once $system.'/bridge.php';
+            try{
+                $manifest=tipiBusinessManifest(dirname(__DIR__));
+                $fingerprint=hash('sha256',json_encode($manifest,JSON_THROW_ON_ERROR));
+                $moduleView='<input type="hidden" name="business_fingerprint" value="'.e($fingerprint).'"><h3>Versions des modules</h3><table><tr><th>Module</th><th>Empreinte SHA-256</th><th>État</th></tr>';
+                foreach($manifest as $file=>$hash)$moduleView.='<tr><td>'.e($file).'</td><td><small style="overflow-wrap:anywhere">'.e($hash).'</small></td><td>'.(($cfg['business_approved'][$file]??null)===$hash?'Approuvé':'À vérifier').'</td></tr>';
+                $moduleView.='</table>';
+            }catch(Throwable $ex){$moduleView='<p>Impossible de vérifier les modules. Les actions non vérifiables sont bloquées.</p>';}
+        }
+        $business='<h2>CodeGraft et applications métier</h2>'.($bridge?'<p>Passerelle OAuth installée : <code>'.e($cfg['url'].'/codegraft-api/').'</code></p><p><a href="/codegraft/standalone/admin.php">Ouvrir les permissions CodeGraft</a></p><form method="post">'.csrf().$moduleView.'<label><input type="checkbox" style="width:auto;display:inline" name="business_read" '.(!empty($cfg['business_read'])?'checked':'').'> Activer les actions métier déclarées (lecture)</label><label><input type="checkbox" style="width:auto;display:inline" name="business_write" '.(!empty($cfg['business_write'])?'checked':'').'> Autoriser les écritures métier</label><label><input type="checkbox" style="width:auto;display:inline" name="business_approve"> Approuver les versions PHP actuellement présentes dans app/McpActions (uniquement après revue du patch)</label><label><input type="checkbox" style="width:auto;display:inline" name="business_clear"> Révoquer toutes les approbations</label><button name="action" value="business_policy">Enregistrer</button></form><p>Le code PHP approuvé est exécuté avec les droits du compte hébergeur : ce n’est pas une sandbox.</p>':'<p>Option non installée. Voir scripts/install-codegraft.sh.</p>');
         $body='<h1>Connexions</h1>'.$business.'<h2>MCP éditorial natif</h2><p>Endpoint : <code>'.e($cfg['url'].'/mcp').'</code></p><p>Authentification Bearer, clé indépendante de l’API. '.(empty($cfg['mcp_hash'])?'Inactif':'Actif').'. Aucun accès au PHP ni au stockage privé.</p><form method="post">'.csrf().'<button name="action" value="mcp_rotate">Générer / renouveler la clé MCP</button><button class="secondary" name="action" value="mcp_revoke">Révoquer</button></form><form method="post">'.csrf().'<label><input style="display:inline;width:auto" type="checkbox" name="mcp_write" '.(!empty($cfg['mcp_write'])?'checked':'').'> Autoriser les brouillons</label><label><input style="display:inline;width:auto" type="checkbox" name="mcp_publish" '.(!empty($cfg['mcp_publish'])?'checked':'').'> Autoriser la publication (nécessite aussi les brouillons)</label><button name="action" value="mcp_policy">Enregistrer les droits</button></form><p class="muted">MCP 2025-11-25 / 2025-06-18 ; Cet endpoint Bearer reste indépendant de la passerelle OAuth CodeGraft.</p><h2>API éditoriale</h2><p>Endpoint : <code>'.e($cfg['url'].'/api/v1').'</code>. La clé API se gère dans Contenus.</p><h2>Le Tipi</h2><p>Association au Hub non disponible dans cette version.</p>';
         shell('Connexions',$body,'',$nav);return;
     }
@@ -777,7 +794,7 @@ function main(): void {
     if(!$cfg){setup($d);return;}
     if(in_array($path,['/codegraft-api','/codegraft-api/','/codegraft/standalone/admin.php','/codegraft-api/oauth/register/','/codegraft-api/oauth/authorize/','/codegraft-api/oauth/token/','/.well-known/oauth-authorization-server','/.well-known/oauth-authorization-server/','/.well-known/oauth-protected-resource','/.well-known/oauth-protected-resource/','/.well-known/oauth-protected-resource/codegraft-api','/.well-known/oauth-protected-resource/codegraft-api/'],true)){
         $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
-        if(!is_file($bridge)||is_link($bridge)){http_response_code(404);return;}
+        if(!is_file($bridge)||is_link($bridge)||!is_file(dirname(__DIR__).'/tipi-system/codegraft/standalone/config.php')){http_response_code(404);return;}
         require_once $bridge; tipiCodeGraftRoute($path,$d,$cfg);return;
     }
     if(str_starts_with($path,'/tipi-install')){http_response_code(404);return;}
