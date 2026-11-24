@@ -78,7 +78,7 @@ try{
     } catch(RuntimeException $ex){expect($ex->getCode()===503,'Synchronization failure surfaced');}
     expect(tipiHubStatus($d)['hector_sync']['count']===1&&tipiHubConfig($d)['hector_sequence']===2,'Keep last confirmed state, reserve next sequence');
     $new=['id'=>str_repeat('d',32),'slug'=>'blog/hector-test','expected_revision'=>'','mode'=>'publish',
-        'fields'=>['title'=>'Hector test','seo_title'=>'SEO','meta_description'=>'Meta','author_name'=>'Auteur','category_name'=>'Cat','content_markdown'=>'A [link](/services).']];
+        'fields'=>['title'=>'Hector test','seo_title'=>'SEO','meta_description'=>'Meta','author_name'=>'Auteur','category_name'=>'Cat','content_html'=>'<p>A <a href="/services">link</a>.</p>']];
     try{tipiHectorApply($d,$new,$token);throw new LogicException('Expected opt-in rejection');}
     catch(RuntimeException $ex){expect($ex->getCode()===403,'Explicit opt-in required');}
     tipiHectorWriteSettings($d,true);
@@ -86,6 +86,7 @@ try{
     expect($first['status']==='applied'&&$first['mode']==='publish','Native publication');
     expect(tipiHectorApply($d,$new,$token)===$first,'Replay returns identical receipt');
     $raw=loadDoc($d,'blog/hector-test','published');[$meta,$body]=front($raw);
+    expect($meta['format']==='html'&&str_contains($body,'<a href="/services">link</a>'),'HTML stored natively');
     expect($meta['seo_title']==='SEO'&&$meta['author']==='Auteur'&&$meta['category']==='Cat','Editorial metadata');
     $change=['id'=>str_repeat('e',32),'slug'=>'blog/hector-test','expected_revision'=>sha($raw),'mode'=>'draft','fields'=>['seo_title'=>'New SEO']];
     tipiHectorApply($d,$change,$token);
@@ -97,6 +98,15 @@ try{
     $dynamic=array_replace($new,['id'=>str_repeat('0',32),'slug'=>'blog/dynamic','fields'=>['title'=>'Dynamic','content_markdown'=>'{{component}}']]);
     try{tipiHectorApply($d,$dynamic,$token);throw new LogicException('Expected dynamic rejection');}
     catch(RuntimeException $ex){expect($ex->getCode()===422,'Dynamic content rejected');}
+    $bad=array_replace($new,['id'=>str_repeat('8',32),'slug'=>'blog/unsafe','fields'=>['title'=>'Unsafe','content_html'=>'<p onclick="alert(1)">unsafe</p>']]);
+    try{tipiHectorApply($d,$bad,$token);throw new LogicException('Expected unsafe HTML refusal');}catch(RuntimeException $ex){expect($ex->getCode()===422,'Event attributes refused');}
+    expect(loadDoc($d,'blog/unsafe','published')===null,'No unsafe publication');
+    $dry=migrateEditorialHtml($d,false);expect($dry['count']===2,'Legacy migration preview');
+    $migration=migrateEditorialHtml($d,true);expect($migration['count']===2&&is_file($migration['backup'].'/published/blog/one.md'),'Legacy backup retained');
+    expect(front(loadDoc($d,'blog/one','published'))[0]['id']===str_repeat('1',24),'Migrated id stable');
+    expect(str_contains(front(loadDoc($d,'blog/one','drafts'))[1],'UNPUBLISHED SECRET'),'Draft migrated independently');
+    expect(migrateEditorialHtml($d,true)['count']===0,'Migration idempotent');
+    expect(str_contains(markdownHtml("# Home\n\n{{component:hero}}"),'<!--tipi:component:hero-->'),'Dynamic marker preserved');
     // Exercise polling, full inventory refresh and acknowledgement recovery.
     $queued=array_replace($new,['id'=>str_repeat('9',32),'slug'=>'blog/poll']);
     $ackAttempts=0;$polls=0;
