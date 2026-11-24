@@ -74,3 +74,49 @@ curl -fsS -H "Cookie: $COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'n
 curl -fsS -H "Cookie: $COOKIE" "$BASE/admin/apps/contacts" | grep -q 'Contact interface'
 php -r '$db=new PDO("sqlite:".getenv("TIPI_DATA_DIR")."/business/contacts.sqlite");if($db->query("SELECT email FROM contacts")->fetchColumn()!=="ui@example.test")exit(1);'
 echo 'Contacts private route and shared database OK'
+
+# Complete OAuth and check that the browser and MCP share the contacts database.
+CONSENT=$(sed -n 's/.*name="_csrf" value="\([^"]*\)".*/\1/p' "$TMP/consent")
+test -n "$CONSENT"
+curl -fsS -D "$TMP/redirect" -o /dev/null -H "Cookie: $COOKIE" -H 'Origin: https://cms.example.test' \
+  --data-urlencode "client_id=$CLIENT" --data-urlencode 'redirect_uri=https://chatgpt.com/connector_platform_oauth_redirect' \
+  --data-urlencode 'response_type=code' --data-urlencode "code_challenge=$CHALLENGE" --data-urlencode 'code_challenge_method=S256' \
+  --data-urlencode 'scope=app:read app:write codegraft:read codegraft:write' --data-urlencode 'state=test' \
+  --data-urlencode "_csrf=$CONSENT" --data-urlencode 'decision=approve' "$BASE/mcp/oauth/authorize/"
+CODE=$(php -r 'foreach(file($argv[1]) as $line){if(stripos($line,"Location: ")===0){parse_str(parse_url(trim(substr($line,10)),PHP_URL_QUERY),$q);echo $q["code"]??"";}}' "$TMP/redirect")
+test -n "$CODE"
+VERIFIER=$(printf 'a%.0s' {1..43})
+curl -fsS --data-urlencode 'grant_type=authorization_code' --data-urlencode "client_id=$CLIENT" --data-urlencode "code=$CODE" --data-urlencode "code_verifier=$VERIFIER" --data-urlencode 'redirect_uri=https://chatgpt.com/connector_platform_oauth_redirect' "$BASE/mcp/oauth/token/" >"$TMP/token"
+ACCESS=$(php -r '$j=json_decode(file_get_contents($argv[1]),true);echo $j["access_token"]??"";' "$TMP/token")
+test -n "$ACCESS"
+rpc(){ curl -fsS -H "Authorization: Bearer $ACCESS" -H 'Content-Type: application/json' -d "$1" "$BASE/mcp"; }
+rpc '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' >"$TMP/tools"
+grep -q 'cms_developer_guide' "$TMP/tools"
+grep -q 'app_contact_list' "$TMP/tools"
+rpc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"app_contact_list","arguments":{}}}' | grep -q 'ui@example.test'
+rpc '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"app_contact_create","arguments":{"name":"Contact MCP","email":"mcp@example.test"}}}' | grep -q '"isError":false'
+curl -fsS -H "Cookie: $COOKIE" "$BASE/admin/apps/contacts" | grep -q 'mcp@example.test'
+mkdir -p "$TIPI_DATA_DIR/published"
+printf '%s\n' '---' 'title: Test home' '---' '# Test home' '{{component:hero}}' >"$TIPI_DATA_DIR/published/home.md"
+php -r '$files=[
+["path"=>"assets/js/animation.js","content"=>"document.addEventListener(\"DOMContentLoaded\",()=>document.body.classList.add(\"ready\"));"],
+["path"=>"assets/css/animation.css","content"=>"h1{color:#884422}"],
+["path"=>"themes/layouts/site.html","content"=>"<!doctype html><html><head>{{head}}</head><body><main id=\"custom-layout\">{{content}}</main><footer>{{credit}}</footer></body></html>"],
+["path"=>"themes/components/hero.html","content"=>"<section>Custom hero</section>"]];foreach($files as &$f)$f["expected_sha256"]="";echo json_encode(["jsonrpc"=>"2.0","id"=>4,"method"=>"tools/call","params"=>["name"=>"cg_prepare_patch","arguments"=>["summary"=>"Test design and animation","files"=>$files]]]);' >"$TMP/patch"
+rpc "$(cat "$TMP/patch")" >"$TMP/prepared"
+PATCH=$(php -r '$j=json_decode(file_get_contents($argv[1]),true);echo $j["result"]["structuredContent"]["id"]??"";' "$TMP/prepared")
+test -n "$PATCH"
+test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/assets/js/animation.js")" = 404
+# Get the exact review fingerprint from the owner panel.
+curl -fsS -H "Cookie: $COOKIE" "$BASE/admin?connections=1" >"$TMP/review"
+FP=$(sed -n 's/.*name="fingerprint" value="\([a-f0-9]*\)".*/\1/p' "$TMP/review" | head -n 1)
+test -n "$FP"
+curl -fsS -H "Cookie: $COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=ai_deploy' --data-urlencode "patch=$PATCH" --data-urlencode "fingerprint=$FP" --data-urlencode 'owner_password=cms-password-123456' "$BASE/admin" >/dev/null
+curl -fsS "$BASE/" >"$TMP/home-html"
+grep -q 'custom-layout' "$TMP/home-html"
+grep -q 'Custom hero' "$TMP/home-html"
+grep -q '/assets/js/animation.js' "$TMP/home-html"
+curl -fsS "$BASE/assets/js/animation.js" | grep -q 'DOMContentLoaded'
+curl -fsS -H "Cookie: $COOKIE" "$BASE/admin" >"$TMP/admin-html"
+if grep -q '/assets/js/animation.js' "$TMP/admin-html"; then exit 1; fi
+echo 'OAuth MCP, shared contacts, reviewed HTML/CSS/JS patch OK'
