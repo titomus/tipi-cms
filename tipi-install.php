@@ -1224,6 +1224,13 @@ function main(): void {
 }
 if (PHP_SAPI === 'cli' && defined('TIPI_LIBRARY_ONLY') && TIPI_LIBRARY_ONLY===true) return;
 if (PHP_SAPI === 'cli') {
+    if(($argv[1]??'')==='--tipi-sync-hector'){
+        try{
+            $d=dataDir();$cfg=jread($d.'/config.json');
+            if(!$cfg)fail('CMS non installé',409);
+            echo json_encode(tipiHectorSync($d,$cfg),JSON_THROW_ON_ERROR).PHP_EOL;exit;
+        }catch(Throwable $ex){fwrite(STDERR,"Synchronisation Hector non confirmée : ".$ex->getMessage().PHP_EOL);exit(1);}
+    }
     if(($argv[1]??'')==='--tipi-flush-events'){
         echo json_encode(tipiHubFlush(dataDir(),20),JSON_THROW_ON_ERROR).PHP_EOL;exit;
     }
