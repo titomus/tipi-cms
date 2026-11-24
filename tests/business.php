@@ -9,7 +9,7 @@ const TIPI_VERSION = 'test';
 function check(bool $ok,string $msg):void{if(!$ok)throw new RuntimeException($msg);}
 $tmp=sys_get_temp_dir().'/tipi-business-test-'.bin2hex(random_bytes(8));mkdir($tmp,0700);
 try{
-    $cfg=['business_read'=>true,'business_write'=>true,'business_approved'=>tipiBusinessManifest($root)];
+    $cfg=['ai_profile'=>'manage','business_read'=>true,'business_write'=>true,'business_approved'=>tipiBusinessManifest($root)];
     // Only test the shipped example when its source exactly matches the repo copy.
     check(isset($cfg['business_approved']['Contacts.php']),'Demo module absent');
     check(hash_equals(hash_file('sha256',dirname(__DIR__).'/examples/Contacts.php'),$cfg['business_approved']['Contacts.php']),'Demo differs: test only the original example');

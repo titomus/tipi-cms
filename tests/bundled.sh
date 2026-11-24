@@ -11,37 +11,47 @@ for tool in git curl wget composer; do printf '#!/bin/sh\nexit 99\n' >"$TMP/no-n
 ORIGINAL_PATH="$PATH"
 export PATH="$TMP/no-network:$PATH"
 php "$HERE/scripts/verify-codegraft.php"
-printf '%s\n' 'test-password-123456789' 'test-password-123456789' | bash "$HERE/scripts/install-codegraft.sh" "$TMP/site" https://cms.example.test
+bash "$HERE/scripts/install-codegraft.sh" "$TMP/site" https://cms.example.test
 test -f "$TMP/site/tipi-system/codegraft/standalone/config.php"
 test ! -e "$TMP/site/public/codegraft"
 cmp "$HERE/tipi-install.php" "$TMP/site/public/index.php"
 php "$HERE/tests/business.php" "$TMP/site"
 echo "Bundled installation OK"
 export PATH="$ORIGINAL_PATH"
-export TIPI_TEST_ROOT="$TMP/site"
+export TIPI_TEST_ROOT="$TMP/site" TIPI_DATA_DIR="$TMP/private"
+mkdir "$TIPI_DATA_DIR"
+php -r 'file_put_contents(getenv("TIPI_DATA_DIR")."/config.json",json_encode(["name"=>"Unified test","url"=>"https://cms.example.test","password_hash"=>password_hash("cms-password-123456",PASSWORD_DEFAULT)]));'
 cat >"$TMP/router.php" <<'PHP'
 <?php
-// Isolated loopback-only fixture: simulate HTTPS as presented by production Apache.
 $_SERVER['HTTPS']='on';
-require getenv('TIPI_TEST_ROOT').'/tipi-system/bridge.php';
-tipiCodeGraftRoute('/codegraft/standalone/admin.php',getenv('TIPI_TEST_ROOT').'/private',['url'=>'https://cms.example.test']);
+$_SERVER['DOCUMENT_ROOT']=getenv('TIPI_TEST_ROOT').'/public';
+require getenv('TIPI_TEST_ROOT').'/public/index.php';
 PHP
 php -S 127.0.0.1:18766 "$TMP/router.php" >"$TMP/admin-server.log" 2>&1 & PID=$!
 sleep 1
-URL=http://127.0.0.1:18766/codegraft/standalone/admin.php
-curl -fsS -D "$TMP/headers" -c "$TMP/cookies" "$URL" >"$TMP/login"
-grep -qi '^Referrer-Policy: same-origin' "$TMP/headers"
-CSRF=$(sed -n 's/.*name="_csrf" value="\([^"]*\)".*/\1/p' "$TMP/login")
+BASE=http://127.0.0.1:18766
+test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/codegraft/standalone/admin.php")" = 303
+curl -fsS -c "$TMP/cookies" "$BASE/admin" >"$TMP/login"
+CSRF=$(sed -n 's/.*name="csrf" value="\([^"]*\)".*/\1/p' "$TMP/login")
 test -n "$CSRF"
-# A foreign or opaque Origin must still be rejected.
+curl -fsS -b "$TMP/cookies" -c "$TMP/cookies" --data-urlencode "csrf=$CSRF" --data-urlencode 'password=cms-password-123456' "$BASE/admin" >/dev/null
+curl -fsS -b "$TMP/cookies" "$BASE/admin?connections=1" >"$TMP/panel"
+grep -q 'Assistant IA' "$TMP/panel"
+grep -q 'Création de fonctionnalités' "$TMP/panel"
+CSRF=$(sed -n 's/.*name="csrf" value="\([^"]*\)".*/\1/p' "$TMP/panel")
+test -n "$CSRF"
+curl -fsS -b "$TMP/cookies" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=ai_profile' --data-urlencode 'profile=build' --data-urlencode 'accept_php=1' "$BASE/admin" >/dev/null
+php -r '$c=json_decode(file_get_contents(getenv("TIPI_DATA_DIR")."/config.json"),true);if($c["ai_profile"]!=="build")exit(1);'
+# OAuth consent recognizes the CMS session rather than the old CodeGraft session.
+curl -fsS -H 'Content-Type: application/json' -d '{"redirect_uris":["https://chatgpt.com/connector_platform_oauth_redirect"]}' "$BASE/codegraft-api/oauth/register/" >"$TMP/client"
+CLIENT=$(php -r '$v=json_decode(file_get_contents($argv[1]),true);echo $v["client_id"]??"";' "$TMP/client")
+test -n "$CLIENT"
+CHALLENGE=$(php -r 'echo rtrim(strtr(base64_encode(hash("sha256",str_repeat("a",43),true)),"+/","-_"),"=");')
+AUTH="$BASE/codegraft-api/oauth/authorize/?response_type=code&client_id=$CLIENT&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fconnector_platform_oauth_redirect&code_challenge=$CHALLENGE&code_challenge_method=S256&scope=app%3Aread%20app%3Awrite%20codegraft%3Aread%20codegraft%3Awrite&state=test"
+test "$(curl -s -o /dev/null -w '%{http_code}' "$AUTH")" = 403
+curl -fsS -b "$TMP/cookies" "$AUTH" >"$TMP/consent"
+grep -q 'Autoriser' "$TMP/consent"
 for origin in null https://other.example.test; do
-  test "$(curl -s -o /dev/null -w '%{http_code}' -H "Origin: $origin" -d 'action=login' "$URL")" = 403
+  test "$(curl -s -o /dev/null -w '%{http_code}' -H "Origin: $origin" -d 'decision=approve' "$AUTH")" = 403
 done
-# The origin fix must not bypass CSRF.
-test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Origin: https://cms.example.test' -d 'action=login' "$URL")" = 419
-# curl does not resend secure cookies over arbitrary HTTP hosts; loopback is trusted.
-COOKIE=$(awk '$6=="codegraft_admin"{print $6"="$7}' "$TMP/cookies")
-test -n "$COOKIE"
-curl -fsS -H "Cookie: $COOKIE" -H 'Origin: https://cms.example.test' --data-urlencode "_csrf=$CSRF" --data-urlencode 'action=login' --data-urlencode 'password=test-password-123456789' "$URL" >"$TMP/logged-in"
-grep -q 'Se déconnecter' "$TMP/logged-in"
-echo 'CodeGraft admin origin and CSRF regression OK'
+echo 'Unified CMS login and OAuth consent OK'

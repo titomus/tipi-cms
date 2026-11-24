@@ -50,7 +50,10 @@ curl -fsS -b "$COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=mc
 rpc '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"cms_save_draft","arguments":{"slug":"mcp-test","raw":"---\ntitle: MCP test\n---\nDraft","expected_sha256":""}}}' | grep -q 'revision'
 test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/mcp-test")" = 404
 rpc '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"cms_publish","arguments":{"slug":"mcp-publish","raw":"---\ntitle: MCP test\n---\nDraft","expected_sha256":""}}}' | grep -q '"isError":true'
-curl -fsS -b "$COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=settings' --data-urlencode 'name=New name' --data-urlencode 'theme=ink' --data-urlencode 'accent=#123456' "$BASE/admin" >/dev/null
+curl -fsS -b "$COOKIE" "$BASE/admin?settings=1" >"$ROOT/design"
+DESIGN=$(sed -n 's/.*name="expected" value="\([a-f0-9]*\)".*/\1/p' "$ROOT/design")
+test -n "$DESIGN"
+curl -fsS -b "$COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode "expected=$DESIGN" --data-urlencode 'action=settings' --data-urlencode 'name=New name' --data-urlencode 'theme=ink' --data-urlencode 'accent=#123456' "$BASE/admin" >/dev/null
 curl -fsS "$BASE/" | grep -q '#123456'
 curl -fsS -b "$COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=mcp_revoke' "$BASE/admin" >/dev/null
 test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $MCP" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' "$BASE/mcp")" = 401

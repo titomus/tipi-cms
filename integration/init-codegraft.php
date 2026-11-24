@@ -8,14 +8,13 @@ if($root===false||!is_dir($root.'/public')||!preg_match('~^https://[a-z0-9][a-z0
 $sys=$root.'/tipi-system';
 require $sys.'/codegraft/bootstrap.php';
 if(file_exists($sys.'/codegraft/standalone/config.php'))throw new RuntimeException('CodeGraft déjà initialisé');
-$password=trim((string)fgets(STDIN),"\r\n");
-if(strlen($password)<16||strlen($password)>72)throw new RuntimeException('Mot de passe : 16 à 72 caractères');
+$password=bin2hex(random_bytes(32)); // Internal owner marker; no separate interactive login.
 $cg=codegraft($root,$vault,'generic');
 if(is_file($cg['vault']->directory.'/admin.json'))throw new RuntimeException('Coffre existant : ne pas réinitialiser');
 $cg['vault']->put('admin.json',['password_hash'=>password_hash($password,PASSWORD_BCRYPT),'created_at'=>gmdate('c')]);
 $policy=$cg['vault']->policy();$policy['read_dirs']=['app/McpActions'];$policy['write_dirs']=[];
 $cg['vault']->savePolicy($policy);
-$cg['vault']->put('endpoint.json',['path'=>'/codegraft-api/','oauth_issuer'=>$url,'oauth_resource'=>$url.'/codegraft-api/','oauth_admin_path'=>'/codegraft/standalone/admin.php','created_at'=>gmdate('c')]);
+$cg['vault']->put('endpoint.json',['path'=>'/codegraft-api/','oauth_issuer'=>$url,'oauth_resource'=>$url.'/codegraft-api/','oauth_admin_path'=>'/admin?connections=1','created_at'=>gmdate('c')]);
 $path=$sys.'/codegraft/standalone/config.php';
 $php="<?php\nreturn ".var_export(['root'=>$root,'vault'=>$cg['vault']->directory,'adapter'=>'generic'],true).";\n";
 $handle=fopen($path,'x');if(!$handle)throw new RuntimeException('Configuration impossible');
