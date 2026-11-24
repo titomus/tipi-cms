@@ -1,0 +1,7 @@
+{
+  "path": "/admin/apps/contacts",
+  "title": "Contacts",
+  "handler": "app/Controllers/Contacts.php",
+  "post": true,
+  "menu": true
+}
