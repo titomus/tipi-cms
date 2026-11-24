@@ -214,7 +214,7 @@ function tipiAiPolicy(string $profile): array {
     $p['read_dirs']=tipiDevDirs();
     $p['write_dirs']=$profile==='build'?tipiDevDirs():[];
     $p['enabled']=$profile==='build';
-    // Upstream prepare() checks delete as well; our gateway never exposes deletion.
+    // Deletion uses the same reviewed patch lifecycle and allowed paths.
     if($p['enabled'])foreach(['list','search','read','prepare','delete','validate','deploy','rollback','history'] as $k)$p['permissions'][$k]=true;
     return $p;
 }
@@ -234,14 +234,14 @@ function tipiPatchReview(array $cg,string $id,string $operation): array {
     if(($record['status']??'')!==($operation==='deploy'?'prepared':'deployed')||($operation==='deploy'&&($record['expires_at']??0)<time()))fail('Version indisponible ou expirée',409);
     if(empty($record['files']))fail('Aucun fichier',409);
     foreach($record['files'] as $entry){
-        if(!tipiDevPath((string)($entry['path']??''))||($entry['operation']??'replace')!=='replace')fail('Fichier hors espace de développement',403);
-        if($operation==='deploy'&&dirname($entry['path'])==='app/Routes'){
+        if(!tipiDevPath((string)($entry['path']??''))||!in_array($entry['operation']??'replace',['replace','delete'],true))fail('Fichier hors espace de développement',403);
+        if($operation==='deploy'&&($entry['operation']??'replace')!=='delete'&&dirname($entry['path'])==='app/Routes'){
             $route=json_decode($entry['content']??'',true,16,JSON_THROW_ON_ERROR);
             if(!is_array($route)||!is_string($route['path']??null)||!preg_match('~^/(?:admin/)?apps/[a-z0-9][a-z0-9-]{0,70}$~D',$route['path'])||!is_string($route['handler']??null)||dirname($route['handler'])!=='app/Controllers'||!tipiDevPath($route['handler'])||!is_string($route['title']??null))fail('Déclaration de route invalide');
         }
     }
     $validation=$operation==='deploy'?$cg['workspace']->validate($id):['valid'=>true,'warning'=>'Les empreintes seront vérifiées par CodeGraft au moment de la restauration.'];
-    return ['id'=>$id,'operation'=>$operation,'summary'=>$record['summary']??'','fingerprint'=>hash('sha256',json_encode($record,JSON_THROW_ON_ERROR)),'files'=>array_map(static fn($e)=>['path'=>$e['path'],'before_sha256'=>$e['before_sha256'],'after_sha256'=>$e['after_sha256']],$record['files']),'validation'=>$validation,'rollback_available'=>$operation==='deploy','database_restored'=>false];
+    return ['id'=>$id,'operation'=>$operation,'summary'=>$record['summary']??'','fingerprint'=>hash('sha256',json_encode($record,JSON_THROW_ON_ERROR)),'files'=>array_map(static fn($e)=>['path'=>$e['path'],'operation'=>$e['operation']??'replace','before_sha256'=>$e['before_sha256'],'after_sha256'=>$e['after_sha256']],$record['files']),'validation'=>$validation,'rollback_available'=>$operation==='deploy','database_restored'=>false];
 }
 function tipiApplyRelease(string $data,array $cg,string $id,string $operation,string $fingerprint,string $channel): array {
     // Serialize profile changes, activation and rollback in the CMS lock.
@@ -268,7 +268,7 @@ function tipiApplyRelease(string $data,array $cg,string $id,string $operation,st
             foreach($record['files'] as $entry){
                 $p=$entry['path'];$hash=$entry['after_sha256'];
                 if(isset($current[$p])&&hash_equals($current[$p],$hash))$c['extension_approved'][$p]=$hash;
-                else unset($c['extension_approved'][$p]);
+                else {unset($c['extension_approved'][$p]);if(dirname($p)==='app/McpActions')unset($c['business_approved'][basename($p)]);}
             }
         }else{
             $prior=jread($history)['prior_approved']??[];
@@ -390,7 +390,7 @@ function tipiAdminPanel(string $data,array $cfg): string {
         if(($draft['status']??'')!=='prepared'||($draft['expires_at']??0)<time())continue;
         $count++;
         $body.='<div class="panel"><h3>'.e((string)($draft['summary']??'Modification')).'</h3><details><summary>Vérifier les fichiers proposés</summary>';
-        foreach($draft['files']??[] as $entry)$body.='<p>'.e((string)$entry['path']).'</p><pre>'.e((string)($entry['content']??'')).'</pre>';
+        foreach($draft['files']??[] as $entry)$body.='<p>'.e((string)$entry['path']).'</p><pre>'.e(($entry['operation']??'replace')==='delete'?'SUPPRESSION DU FICHIER':(string)($entry['content']??'')).'</pre>';
         $body.='</details><form method="post">'.csrf().'<input type="hidden" name="patch" value="'.$id.'"><input type="hidden" name="fingerprint" value="'.hash('sha256',json_encode($draft,JSON_THROW_ON_ERROR)).'">'.field('owner_password','Votre mot de passe','','password').'<button name="action" value="ai_deploy">Installer et activer cette fonctionnalité</button></form></div>';
         if($count>=10)break;
     }
@@ -439,7 +439,7 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
     if($profile==='read')$cfg['business_write']=false;
     $cgWrite=tipiScope($principal,\CodeGraft\DynamicOAuth::WRITE);
     $cfg['oauth_development']=$profile==='build'&&$cgRead&&$cgWrite;
-    $devDefs=array_values(array_filter(\CodeGraft\Mcp::definitions(),static fn($t)=>in_array($t['name'],['cg_capabilities','cg_list_files','cg_search','cg_project_map','cg_read_files','cg_prepare_patch','cg_prepare_diff','cg_validate_patch','cg_history'],true)));
+    $devDefs=array_values(array_filter(\CodeGraft\Mcp::definitions(),static fn($t)=>in_array($t['name'],['cg_capabilities','cg_list_files','cg_search','cg_project_map','cg_read_files','cg_prepare_patch','cg_prepare_diff','cg_prepare_delete','cg_validate_patch','cg_history'],true)));
     if($method==='tools/list'){
         $defs=($cgRead||$cgWrite)&&($cfg['ai_profile']??'read')==='build'?$devDefs:[];
         if($canRead){
@@ -514,7 +514,7 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
             return tipiToolResult($id,$info);
         }
         if(!$canRead)return tipiToolError($id,'Scope app:read requis');
-        if(in_array($name,['cms_save_draft','cms_publish','cms_update_design'],true)&&!$canWrite)return tipiToolError($id,'Scope app:write requis');
+        if(in_array($name,['cms_save_draft','cms_publish','cms_update_design','cms_delete_page','cms_delete_pages','cms_restore_page'],true)&&!$canWrite)return tipiToolError($id,'Scope app:write requis');
         // OAuth permissions are derived from the live profile and consented scopes, independently of legacy Bearer keys.
         try{return tipiToolResult($id,mcpCall($data,$cfg,$name,$args));}
         catch(Throwable $ex){return tipiToolError($id,$ex instanceof RuntimeException&&$ex->getCode()<500?$ex->getMessage():'Action éditoriale indisponible');}
@@ -525,7 +525,7 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
     foreach(array_merge($policy['read_dirs']??[],$policy['write_dirs']??[]) as $dir)
         if(!is_string($dir)||!in_array($dir,tipiDevDirs(),true))
             return tipiToolError($id,'Réenregistrez le profil Création de fonctionnalités dans Assistant IA.');
-    if(in_array($name,['cg_prepare_patch','cg_prepare_diff'],true)){
+    if(in_array($name,['cg_prepare_patch','cg_prepare_diff','cg_prepare_delete'],true)){
         foreach($args['files']??[] as $file)if(!is_array($file)||!tipiDevPath((string)($file['path']??'')))return tipiToolError($id,'Fichier hors espace de développement autorisé');
     }
     return $system['mcp']->dispatch($request,$principal);
