@@ -578,7 +578,7 @@ const TIPI_ANALYTICS_ORIGIN='https://analitycs.le-tipi.club';
 const TIPI_OPTIMIZE_ORIGIN='https://optimize.le-tipi.club';
 function tipiHubConfig(string $d): array {return jread($d.'/hub.json');}
 function tipiHubEnabled(array $h): bool {return ($h['analytics']??false)===true&&is_string($h['tracker_key']??null)&&preg_match('~^[a-zA-Z0-9_-]{16,128}$~D',$h['tracker_key'])===1;}
-function tipiHubBinding(array $h): string {return substr(hash('sha256',($h['installation_uid']??'').'|'.($h['tracker_key']??'').'|'.(!empty($h['optimize'])?'1':'0')),0,32);}
+function tipiHubBinding(array $h): string {return substr(hash('sha256',($h['installation_uid']??'').'|'.($h['consent_epoch']??'').'|'.($h['tracker_key']??'').'|'.(!empty($h['optimize'])?'1':'0')),0,32);}
 function tipiHubConsent(array $h): bool {return tipiHubEnabled($h)&&hash_equals(tipiHubBinding($h).'.yes',(string)($_COOKIE['tipi_metrics_consent']??''));}
 function tipiHubStatus(string $d): array {
     $h=tipiHubConfig($d);
@@ -588,7 +588,7 @@ function tipiHubSettings(string $d,array $post): void {
     $key=trim((string)($post['tracker_key']??''));
     if($key!==''&&!preg_match('~^[a-zA-Z0-9_-]{16,128}$~D',$key))fail('Clé de suivi invalide');
     locked($d,function()use($d,$post,$key){
-        $h=tipiHubConfig($d);
+        $h=tipiHubConfig($d);$old=$h;
         if(($post['action']??'')==='hub_disconnect'){
             $h['analytics']=false;$h['optimize']=false;$h['tracker_key']='';
         }else{
@@ -597,6 +597,9 @@ function tipiHubSettings(string $d,array $post): void {
             if($h['analytics']&&!tipiHubEnabled($h))fail('Clé de suivi nécessaire');
         }
         $h['installation_uid']=$h['installation_uid']??bin2hex(random_bytes(16));
+        if(!isset($h['consent_epoch'])||($old['tracker_key']??'')!==$h['tracker_key']||!empty($old['analytics'])!==!empty($h['analytics'])||!empty($old['optimize'])!==!empty($h['optimize'])){
+            $h['consent_epoch']=bin2hex(random_bytes(12));
+        }
         jwrite($d.'/hub.json',$h);
     });
 }
@@ -647,7 +650,7 @@ function tipiMetricsJs(): string {
   function choose(value) {
     if (value !== 'yes') clearTrackerState();
     document.cookie = 'tipi_metrics_consent=' + encodeURIComponent(binding + '.' + value) + '; Path=/; Max-Age=' + (value === 'reset' ? 0 : 15552000) + '; SameSite=Lax' + (location.protocol === 'https:' ? '; Secure' : '');
-    location.reload();
+    location.replace(location.pathname + location.search + location.hash);
   }
   document.addEventListener('click', function (event) {
     var button = event.target.closest && event.target.closest('#tipi-metrics-consent [data-tipi-consent-choice]');
@@ -1099,6 +1102,7 @@ function main(): void {
     if(!preg_match('~^(?:blog/)?[a-z0-9][a-z0-9-]{0,99}$~D',$slug)||in_array($slug,['admin','api','assets','robots','sitemap','404','mcp','codegraft','codegraft-api'],true)){http_response_code(404);shell('Page introuvable','<h1>Page introuvable</h1>','<meta name="robots" content="noindex">');return;}
     publicPage($d,$cfg,$slug);
 }
+if (PHP_SAPI === 'cli' && defined('TIPI_LIBRARY_ONLY') && TIPI_LIBRARY_ONLY===true) return;
 if (PHP_SAPI === 'cli') {
     if(($argv[1]??'')==='--tipi-flush-events'){
         echo json_encode(tipiHubFlush(dataDir(),20),JSON_THROW_ON_ERROR).PHP_EOL;exit;
