@@ -133,12 +133,27 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
 function tipiCodeGraftRoute(string $path,string $data,array $cfg): void {
     header('Cache-Control: no-store');header('X-Robots-Tag: noindex, nofollow');
     // Do not accept proxy-controlled Host as an OAuth origin.
-    if(!str_starts_with($cfg['url'],'https://')||empty($_SERVER['HTTPS'])||$_SERVER['HTTPS']==='off'){http_response_code(403);return;}
+    if(!str_starts_with($cfg['url'],'https://')||empty($_SERVER['HTTPS'])||$_SERVER['HTTPS']==='off'){
+        http_response_code(403);header('Content-Type: text/plain; charset=utf-8');
+        echo 'Tipi CodeGraft : HTTPS obligatoire.';return;
+    }
     $origin=$_SERVER['HTTP_ORIGIN']??'';
-    if($origin!==''&&$origin!==$cfg['url']){http_response_code(403);return;}
+    if($origin!==''&&$origin!==$cfg['url']){
+        http_response_code(403);header('Content-Type: text/plain; charset=utf-8');
+        echo 'Tipi CodeGraft : origine de la requête refusée. Ouvrez la page de connexion directement sur le domaine configuré et rechargez-la.';return;
+    }
     if($path==='/codegraft/standalone/admin.php'){
         $_SERVER['SCRIPT_NAME']=$path;
-        require __DIR__.'/codegraft/standalone/admin.php';return;
+        // The upstream admin emits no-referrer. Browsers may then send Origin: null
+        // for its same-origin form POST, which our strict origin check rejects.
+        // Buffer the response so we can set same-origin before headers are sent.
+        // Cross-origin referrers stay hidden; HTTPS, Origin and CSRF checks remain.
+        ob_start();
+        try {
+            require __DIR__.'/codegraft/standalone/admin.php';
+            header('Referrer-Policy: same-origin',true);
+        } finally { ob_end_flush(); }
+        return;
     }
     require __DIR__.'/codegraft/standalone/bootstrap.php';
     $oauth=new \CodeGraft\OAuthHttp($codegraft['vault']);
