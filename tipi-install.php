@@ -632,7 +632,7 @@ function admin(string $d,array $cfg): void {
     if($post) {
         verifyCsrf(); $act=(string)($_POST['action']??'');
         if($act==='logout'){$_SESSION=[];session_destroy();redirect('/admin');}
-        if(in_array($act,['ai_profile','ai_deploy','ai_rollback','ai_revoke','ai_approve_module'],true)){
+        if(in_array($act,['ai_profile','ai_deploy','ai_rollback','ai_revoke','ai_approve_module','ai_enable_contacts'],true)){
             $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
             if(!is_file($bridge)||is_link($bridge))fail('Assistant IA non installé',409);
             require_once $bridge;
