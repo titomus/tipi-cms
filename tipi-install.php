@@ -638,8 +638,16 @@ function tipiHubPairing(string $d,array $cfg,string $action,?callable $request=n
 }
 // Complete, bounded inventory of published source documents; drafts are never transmitted.
 function tipiHectorDocuments(string $d): array {
-    $docs=[];$ids=[];
-    foreach(['','blog/'] as $sub)foreach(glob($d.'/published/'.$sub.'*.md')?:[] as $file){
+    $docs=[];$ids=[];$files=[];
+    if(!is_dir($d.'/published')||!is_readable($d.'/published'))fail('Stockage éditorial indisponible',503);
+    foreach(['','blog/'] as $sub){
+        $dir=$d.'/published/'.$sub;
+        if(!is_dir($dir)){if($sub==='blog/')continue;fail('Stockage éditorial indisponible',503);}
+        if(!is_readable($dir))fail('Stockage éditorial indisponible',503);
+        $list=glob($dir.'*.md');if($list===false)fail('Inventaire éditorial indisponible',503);
+        foreach($list as $file)$files[]=[$sub,$file];
+    }
+    foreach($files as [$sub,$file]){
         $slug=slugok($sub.basename($file,'.md'));
         $raw=loadDoc($d,$slug,'published');
         if($raw===null||strlen($raw)>MAX_CONTENT)fail('Inventaire éditorial incomplet',409);
