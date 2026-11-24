@@ -36,7 +36,39 @@ try{
     tipiHubSettings($d,['action'=>'hub_save','tracker_key'=>'not-a-real-tracker-key-123','analytics'=>'1']);
     expect(tipiHubBinding(tipiHubConfig($d))!==$binding,'Old consent invalidated on reconnection');
     expect(!Tipi::track('quote_requested',[],'quote:43'),'No re-use of prior consent');
-    echo "Tracking SDK offline tests OK\n";
+    // Mock transport: exercise native pairing without any external request.
+    $calls=[];$token='ltcms_'.str_repeat('a',48);$poll=str_repeat('b',48);
+    $key='fake-paired-tracker-123456';$public=str_repeat('c',24);
+    $request=function($method,$path,$payload=[],$headers=[])use(&$calls,$token,$poll,$key,$public){
+        $calls[]=[$method,$path,$payload,$headers];
+        if($path==='pairings/init')return ['pairing'=>['public_id'=>$public,'poll_token'=>$poll,'pairing_code'=>'ABC234']];
+        if($path==='pairings/'.$public)return ['pairing'=>['status'=>'approved','platform'=>'tipi_cms','access_token'=>$token,'tracker_key'=>$key,'site_id'=>42]];
+        if($path==='site-config')return ['site'=>['platform'=>'tipi_cms','tracker_key'=>$key,'site_id'=>42]];
+        if($path==='revoke')return ['status'=>'ok'];
+        throw new RuntimeException('Unexpected request');
+    };
+    $cfg=jread($d.'/config.json');
+    tipiHubPairing($d,$cfg,'hub_pair_start',$request);
+    expect($calls[0][2]['platform']==='tipi_cms','CMS pairing platform');
+    expect(tipiHubConfig($d)['pairing']['poll_token']===$poll,'Private poll token persisted');
+    tipiHubPairing($d,$cfg,'hub_pair_finish',$request);
+    expect($calls[1][3]===['X-Tipi-Poll-Token: '.$poll],'Poll secret only in header');
+    expect(tipiHubStatus($d)['mode']==='paired','Paired mode');
+    expect(tipiHubConfig($d)['tracker_key']===$key,'Automatically obtain tracking key');
+    expect(!str_contains(json_encode(tipiHubStatus($d)),$token),'No bearer in public tracking status');
+    tipiHubPairing($d,$cfg,'hub_refresh',$request);
+    expect($calls[2][3]===['Authorization: Bearer '.$token],'Authenticated refresh');
+    try {
+        tipiHubPairing($d,$cfg,'hub_disconnect',fn()=>fail('Temporary outage',503));
+        throw new LogicException('Expected outage');
+    } catch(RuntimeException $ex) {
+        expect($ex->getCode()===503,'Temporary failure surfaced');
+    }
+    expect(tipiHubStatus($d)['mode']==='paired','Temporary outage preserves connection');
+    tipiHubPairing($d,$cfg,'hub_disconnect',$request);
+    expect($calls[3][1]==='revoke'&&tipiHubStatus($d)['mode']==='disconnected','Remote revoke then local disconnect');
+    expect(!isset(tipiHubConfig($d)['access_token']),'Local bearer removed');
+    echo "Tracking SDK and pairing offline tests OK\n";
 }finally{
     // Shutdown queue flush is disabled, and its configuration no longer exists.
     $it=new RecursiveIteratorIterator(new RecursiveDirectoryIterator($d,FilesystemIterator::SKIP_DOTS),RecursiveIteratorIterator::CHILD_FIRST);
