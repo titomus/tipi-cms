@@ -10,5 +10,6 @@ jobs:
       - uses: shivammathur/setup-php@v2
         with:
           php-version: '8.2'
-      - run: php -l tipi-install.php
+      - run: find . -name '*.php' -not -path './.git/*' -print0 | xargs -0 -n1 php -l
+      - run: bash -n scripts/install-codegraft.sh scripts/update.sh tests/smoke.sh
       - run: bash tests/smoke.sh
