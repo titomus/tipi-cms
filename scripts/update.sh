@@ -22,6 +22,7 @@ SYSTEM="$(dirname "$TARGET")/tipi-system"
 if [[ -e "$SYSTEM" ]]; then
   [[ -d "$SYSTEM" && ! -L "$SYSTEM" && -f "$SYSTEM/bridge.php" && ! -L "$SYSTEM/bridge.php" ]] || { echo "Intégration existante invalide"; exit 1; }
   php -l "$HERE/integration/bridge.php"
+  php "$HERE/integration/install-extensions.php" "$(dirname "$TARGET")"
   cp -p "$SYSTEM/bridge.php" "$SAVE/bridge.php"
   BRIDGE_TMP="$(mktemp "$SYSTEM/.bridge-update-XXXXXXXX.php")"
   trap 'rm -f "$TMP" "$BRIDGE_TMP"' EXIT
@@ -32,6 +33,9 @@ fi
 if ! mv -f "$TMP" "$TARGET/index.php"; then
   if [[ -f "$SAVE/bridge.php" ]]; then cp -p "$SAVE/bridge.php" "$SYSTEM/bridge.php"; fi
   exit 1
+fi
+if [[ -f "$SAVE/bridge.php" ]]; then
+  php "$HERE/integration/migrate-endpoint.php" "$(dirname "$TARGET")" "$SAVE"
 fi
 if [[ -f "$SAVE/bridge.php" ]]; then echo "Rollback intégration : cp -p '$SAVE/bridge.php' '$SYSTEM/bridge.php'"; fi
 echo "Noyau mis à jour. Aucune donnée éditoriale modifiée."
