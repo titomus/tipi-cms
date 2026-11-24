@@ -345,7 +345,7 @@ final class MiniMarkdown {
   }
 }
 
-const TIPI_VERSION = '0.5.0-preview';
+const TIPI_VERSION = '0.6.0-preview';
 const TIPI_SETUP_HASH = '';
 const MAX_CONTENT = 262144;
 
@@ -632,7 +632,7 @@ function admin(string $d,array $cfg): void {
     if($post) {
         verifyCsrf(); $act=(string)($_POST['action']??'');
         if($act==='logout'){$_SESSION=[];session_destroy();redirect('/admin');}
-        if(in_array($act,['ai_profile','ai_deploy','ai_rollback','ai_revoke','ai_approve_module','ai_enable_contacts'],true)){
+        if(in_array($act,['ai_profile','ai_approval_mode','ai_deploy','ai_rollback','ai_revoke','ai_approve_module','ai_enable_contacts'],true)){
             $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
             if(!is_file($bridge)||is_link($bridge))fail('Assistant IA non installé',409);
             require_once $bridge;
@@ -775,7 +775,7 @@ function mcpCall(string $d,array $cfg,string $name,array $args): array {
         if(!is_string($args['expected_sha256']??null))fail('expected_sha256 requis');
         $expected=$args['expected_sha256'];unset($args['expected_sha256']);return changeDesign($d,$args,$expected);
     }
-    if($name==='cms_site_info')return ['name'=>$cfg['name'],'url'=>$cfg['url'],'version'=>TIPI_VERSION,'storage'=>'markdown','draft_write'=>!empty($cfg['mcp_write']),'publish'=>!empty($cfg['mcp_publish']),'ai_profile'=>$cfg['ai_profile']??'read','design'=>['read'=>true,'write'=>!empty($cfg['mcp_write'])&&!empty($cfg['mcp_publish']),'layouts'=>['classic','wide','centered','editorial'],'custom_css'=>true],'business'=>['read'=>!empty($cfg['business_read']),'write'=>!empty($cfg['business_write']),'development'=>($cfg['ai_profile']??'read')==='build','guide'=>'Utiliser cms_developer_guide : créer des routes, vues, contrôleurs, services, actions MCP, layouts HTML, composants et assets CSS/JS, puis préparer un patch à approuver dans Assistant IA.']];
+    if($name==='cms_site_info')return ['name'=>$cfg['name'],'url'=>$cfg['url'],'version'=>TIPI_VERSION,'storage'=>'markdown','draft_write'=>!empty($cfg['mcp_write']),'publish'=>!empty($cfg['mcp_publish']),'ai_profile'=>$cfg['ai_profile']??'read','design'=>['read'=>true,'write'=>!empty($cfg['mcp_write'])&&!empty($cfg['mcp_publish']),'layouts'=>['classic','wide','centered','editorial'],'custom_css'=>true],'business'=>['read'=>!empty($cfg['business_read']),'write'=>!empty($cfg['business_write']),'development'=>($cfg['ai_profile']??'read')==='build','guide'=>'Utiliser cms_developer_guide : créer des routes, vues, contrôleurs, services, actions MCP, layouts HTML, composants et assets CSS/JS, puis préparer et vérifier un patch avec cg_review_release. Respecter le mode de validation sélectionné.']];
     if($name==='cms_list_pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
         foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug))];
