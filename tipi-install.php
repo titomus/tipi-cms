@@ -611,7 +611,13 @@ function admin(string $d,array $cfg): void {
             redirect('/admin?settings=1');
         }
         if($act==='business_policy'){
-            locked($d,function()use($d){$c=jread($d.'/config.json');$c['business_read']=isset($_POST['business_read']);$c['business_write']=$c['business_read']&&isset($_POST['business_write']);jwrite($d.'/config.json',$c);});
+            $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
+            if(!is_file($bridge)||is_link($bridge))fail('CodeGraft non installé',409);
+            require_once $bridge;
+            locked($d,function()use($d){$c=jread($d.'/config.json');$c['business_read']=isset($_POST['business_read']);$c['business_write']=$c['business_read']&&isset($_POST['business_write']);
+                if(isset($_POST['business_approve']))$c['business_approved']=tipiBusinessManifest(dirname(__DIR__));
+                if(isset($_POST['business_clear'])){$c['business_approved']=[];$c['business_read']=false;$c['business_write']=false;}
+                jwrite($d.'/config.json',$c);});
             redirect('/admin?connections=1');
         }
         if($act==='mcp_rotate'){
@@ -649,7 +655,7 @@ function admin(string $d,array $cfg): void {
     }
     if(isset($_GET['connections'])){
         $bridge=is_file(dirname(__DIR__).'/tipi-system/bridge.php');
-        $business='<h2>CodeGraft et applications métier</h2>'.($bridge?'<p>Passerelle OAuth installée : <code>'.e($cfg['url'].'/codegraft-api/').'</code></p><p><a href="/codegraft/standalone/admin.php">Ouvrir les permissions CodeGraft</a></p><form method="post">'.csrf().'<label><input type="checkbox" style="width:auto;display:inline" name="business_read" '.(!empty($cfg['business_read'])?'checked':'').'> Activer les actions métier déclarées (lecture)</label><label><input type="checkbox" style="width:auto;display:inline" name="business_write" '.(!empty($cfg['business_write'])?'checked':'').'> Autoriser les écritures métier</label><button name="action" value="business_policy">Enregistrer</button></form><p>Le code PHP approuvé est exécuté avec les droits du compte hébergeur : ce n’est pas une sandbox.</p>':'<p>Option non installée. Voir scripts/install-codegraft.sh.</p>');
+        $business='<h2>CodeGraft et applications métier</h2>'.($bridge?'<p>Passerelle OAuth installée : <code>'.e($cfg['url'].'/codegraft-api/').'</code></p><p><a href="/codegraft/standalone/admin.php">Ouvrir les permissions CodeGraft</a></p><form method="post">'.csrf().'<label><input type="checkbox" style="width:auto;display:inline" name="business_read" '.(!empty($cfg['business_read'])?'checked':'').'> Activer les actions métier déclarées (lecture)</label><label><input type="checkbox" style="width:auto;display:inline" name="business_write" '.(!empty($cfg['business_write'])?'checked':'').'> Autoriser les écritures métier</label><label><input type="checkbox" style="width:auto;display:inline" name="business_approve"> Approuver les versions PHP actuellement présentes dans app/McpActions (uniquement après revue du patch)</label><label><input type="checkbox" style="width:auto;display:inline" name="business_clear"> Révoquer toutes les approbations</label><button name="action" value="business_policy">Enregistrer</button></form><p>Le code PHP approuvé est exécuté avec les droits du compte hébergeur : ce n’est pas une sandbox.</p>':'<p>Option non installée. Voir scripts/install-codegraft.sh.</p>');
         $body='<h1>Connexions</h1>'.$business.'<h2>MCP éditorial natif</h2><p>Endpoint : <code>'.e($cfg['url'].'/mcp').'</code></p><p>Authentification Bearer, clé indépendante de l’API. '.(empty($cfg['mcp_hash'])?'Inactif':'Actif').'. Aucun accès au PHP ni au stockage privé.</p><form method="post">'.csrf().'<button name="action" value="mcp_rotate">Générer / renouveler la clé MCP</button><button class="secondary" name="action" value="mcp_revoke">Révoquer</button></form><form method="post">'.csrf().'<label><input style="display:inline;width:auto" type="checkbox" name="mcp_write" '.(!empty($cfg['mcp_write'])?'checked':'').'> Autoriser les brouillons</label><label><input style="display:inline;width:auto" type="checkbox" name="mcp_publish" '.(!empty($cfg['mcp_publish'])?'checked':'').'> Autoriser la publication (nécessite aussi les brouillons)</label><button name="action" value="mcp_policy">Enregistrer les droits</button></form><p class="muted">MCP 2025-11-25 / 2025-06-18 ; Cet endpoint Bearer reste indépendant de la passerelle OAuth CodeGraft.</p><h2>API éditoriale</h2><p>Endpoint : <code>'.e($cfg['url'].'/api/v1').'</code>. La clé API se gère dans Contenus.</p><h2>Le Tipi</h2><p>Association au Hub non disponible dans cette version.</p>';
         shell('Connexions',$body,'',$nav);return;
     }
@@ -779,7 +785,7 @@ function main(): void {
     if(str_starts_with($path,'/api/'))api($d,$cfg,$path);
     if($path==='/mcp'||$path==='/mcp/')mcp($d,$cfg);
     if(!in_array($_SERVER['REQUEST_METHOD'],['GET','HEAD'],true)){http_response_code(405);return;}
-    if($path==='/robots.txt'){header('Content-Type: text/plain; charset=utf-8');echo "User-agent: *\nDisallow: /admin\nDisallow: /api/\nDisallow: /mcp\nSitemap: ".$cfg['url']."/sitemap.xml\n";return;}
+    if($path==='/robots.txt'){header('Content-Type: text/plain; charset=utf-8');echo "User-agent: *\nDisallow: /admin\nDisallow: /api/\nDisallow: /mcp\nDisallow: /codegraft\nDisallow: /codegraft-api/\nSitemap: ".$cfg['url']."/sitemap.xml\n";return;}
     if($path==='/sitemap.xml'){header('Content-Type: application/xml; charset=utf-8');echo '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">';foreach(inventory($d)as $slug=>$m)if(!noindex($m)){echo '<url><loc>'.e($cfg['url'].pageurl($slug)).'</loc>';if(!empty($m['modified'])&&strtotime($m['modified'])!==false)echo '<lastmod>'.gmdate('Y-m-d',strtotime($m['modified'])).'</lastmod>';echo '</url>';}echo '</urlset>';return;}
     if($path==='/home'){header('Location: /',true,301);return;}
     if($path!=='/'&&str_ends_with($path,'/')&&preg_match('~^/(?:blog/)?[a-z0-9][a-z0-9-]{0,99}/$~D',$path)){header('Location: '.rtrim($path,'/'),true,301);return;}
