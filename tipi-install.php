@@ -594,18 +594,19 @@ function tipiHubRequest(string $method,string $path,array $payload=[],array $hea
     }
     return $result;
 }
-function tipiHubPairing(string $d,array $cfg,string $action): void {
-    locked($d,function()use($d,$cfg,$action){
+function tipiHubPairing(string $d,array $cfg,string $action,?callable $request=null): void {
+    $request=$request??'tipiHubRequest';
+    locked($d,function()use($d,$cfg,$action,$request){
         $h=tipiHubConfig($d);$h['installation_uid']=$h['installation_uid']??bin2hex(random_bytes(16));
         if($action==='hub_pair_start'){
             if(!empty($h['access_token']))fail('Déconnectez le site avant de le réassocier',409);
-            $p=tipiHubRequest('POST','pairings/init',['platform'=>'tipi_cms','site_url'=>$cfg['url'],'installation_uid'=>$h['installation_uid'],'plugin_version'=>TIPI_VERSION])['pairing']??[];
+            $p=$request('POST','pairings/init',['platform'=>'tipi_cms','site_url'=>$cfg['url'],'installation_uid'=>$h['installation_uid'],'plugin_version'=>TIPI_VERSION])['pairing']??[];
             if(!preg_match('~^[a-f0-9]{24}$~D',(string)($p['public_id']??''))||!preg_match('~^[a-f0-9]{48}$~D',(string)($p['poll_token']??''))||!preg_match('~^[A-Z2-9]{6}$~D',(string)($p['pairing_code']??'')))fail('Réponse de jumelage invalide',502);
             $h['pairing']=['public_id'=>$p['public_id'],'poll_token'=>$p['poll_token'],'pairing_code'=>$p['pairing_code']];
         }elseif($action==='hub_pair_finish'){
             $p=$h['pairing']??[];
             if(empty($p['public_id'])||empty($p['poll_token']))fail('Lancez d’abord une connexion',409);
-            $result=tipiHubRequest('GET','pairings/'.rawurlencode($p['public_id']),[],['X-Tipi-Poll-Token: '.$p['poll_token']])['pairing']??[];
+            $result=$request('GET','pairings/'.rawurlencode($p['public_id']),[],['X-Tipi-Poll-Token: '.$p['poll_token']])['pairing']??[];
             if(($result['status']??'')==='pending')fail('Autorisez d’abord le site dans le Hub',409);
             if(($result['status']??'')!=='approved'){
                 unset($h['pairing']);jwrite($d.'/hub.json',$h);fail('Demande expirée ou déjà utilisée. Relancez la connexion.',409);
@@ -617,9 +618,9 @@ function tipiHubPairing(string $d,array $cfg,string $action): void {
             if(!empty($h['access_token'])){
                 try{
                     $headers=['Authorization: Bearer '.$h['access_token']];
-                    if($action==='hub_disconnect'){tipiHubRequest('POST','revoke',[],$headers);}
+                    if($action==='hub_disconnect'){$request('POST','revoke',[],$headers);}
                     else{
-                        $site=tipiHubRequest('GET','site-config',[],$headers)['site']??[];
+                        $site=$request('GET','site-config',[],$headers)['site']??[];
                         if(($site['platform']??'')!=='tipi_cms'||(int)($site['site_id']??0)!==(int)$h['site_id']||!preg_match('~^[a-zA-Z0-9_-]{16,128}$~D',(string)($site['tracker_key']??'')))fail('Configuration Hub incohérente',502);
                         if($site['tracker_key']!==$h['tracker_key']){$h['tracker_key']=$site['tracker_key'];$h['consent_epoch']=bin2hex(random_bytes(12));}
                     }
@@ -648,6 +649,7 @@ function tipiHubSettings(string $d,array $post): void {
     locked($d,function()use($d,$post,$key){
         $h=tipiHubConfig($d);$old=$h;
         if(($post['action']??'')==='hub_disconnect'){
+            if(!empty($h['access_token']))fail('Utilisez la déconnexion native pour révoquer le jeton Hub',409);
             $h['analytics']=false;$h['optimize']=false;$h['tracker_key']='';
         }else{
             if(!empty($h['access_token'])&&$key!==''&&$key!==($h['tracker_key']??''))fail('La clé est gérée par le Hub',409);
