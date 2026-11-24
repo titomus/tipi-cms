@@ -496,11 +496,12 @@ function trashDocuments(string $d,array $items): array {
     });
 }
 function trashList(string $d): array {
-    $files=glob($d.'/trash/*.json')?:[];rsort($files);$out=[];
+    $files=glob($d.'/trash/*.json')?:[];rsort($files);$out=[];$seen=[];
     foreach(array_slice($files,0,100) as $f){
         $batch=jread($f);
         foreach($batch['documents']??[] as $slug=>$doc){
-            if(effective($d,$slug)!==null)continue;
+            if(isset($seen[$slug])||effective($d,$slug)!==null)continue;
+            $seen[$slug]=true;
             $out[]=['slug'=>$slug,'title'=>$doc['title'],'revision'=>$doc['revision'],'batch'=>$batch['id'],'deleted_at'=>$batch['time']];
         }
     }
@@ -838,7 +839,10 @@ function mcpCall(string $d,array $cfg,string $name,array $args): array {
     if(in_array($name,['cms_delete_page','cms_delete_pages','cms_restore_page'],true)){
         if(empty($cfg['mcp_write'])||empty($cfg['mcp_publish']))fail('Permission de publication et suppression requise',403);
         if($name==='cms_delete_page')return trashDocuments($d,[$args]);
-        if($name==='cms_delete_pages')return trashDocuments($d,$args['pages']??[]);
+        if($name==='cms_delete_pages'){
+            if(!is_array($args['pages']??null))fail('Liste de documents requise');
+            return trashDocuments($d,$args['pages']);
+        }
         if(!is_string($args['slug']??null)||!is_string($args['revision']??null))fail('Slug et révision requis');
         restoreDoc($d,$args['slug'],$args['revision'],'');
         return ['status'=>'restored','slug'=>$args['slug'],'url'=>pageurl($args['slug'])];
