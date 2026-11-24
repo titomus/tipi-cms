@@ -5,7 +5,7 @@ HERE="$(cd "$(dirname "$0")/.." && pwd)"
 ROOT="$(cd "$1" && pwd -P)"
 ORIGIN="$2"
 [[ -f "$ROOT/public/index.php" && ! -L "$ROOT/public/index.php" ]] || { echo "Installation Tipi CMS absente"; exit 1; }
-grep -q "const TIPI_VERSION = '0.4.0-preview'" "$ROOT/public/index.php" || { echo "Mettre à jour Tipi CMS en 0.4 avant CodeGraft"; exit 1; }
+grep -q "const TIPI_VERSION = '0.5.0-preview'" "$ROOT/public/index.php" || { echo "Mettre à jour Tipi CMS en 0.5 avant CodeGraft"; exit 1; }
 [[ "$ORIGIN" =~ ^https://[a-z0-9][a-z0-9.-]+$ ]] || exit 1
 php -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);' || { echo "Activer pdo_sqlite (CLI et Web)"; exit 1; }
 [[ ! -e "$ROOT/tipi-system" && ! -L "$ROOT/tipi-system" && ! -L "$ROOT/app" && ! -L "$ROOT/app/McpActions" ]] || { echo "Système existant : ne pas écraser"; exit 1; }
@@ -29,8 +29,8 @@ if ! php "$HERE/integration/init-codegraft.php" "$ROOT" "$VAULT" "$ORIGIN"; then
   echo "Initialisation incomplète : conserver les fichiers et le coffre pour diagnostic ; aucune donnée du CMS modifiée."
   exit 1
 fi
-if [[ ! -e "$ROOT/app/McpActions/Contacts.php" ]]; then cp -n "$HERE/examples/Contacts.php" "$ROOT/app/McpActions/Contacts.php"; fi
-echo "MCP OAuth : $ORIGIN/codegraft-api/"
+php "$HERE/integration/install-extensions.php" "$ROOT"
+echo "MCP OAuth : $ORIGIN/mcp"
 echo "Administration unique : $ORIGIN/admin?connections=1"
 echo "Approbations métier : $ORIGIN/admin?connections=1"
 echo "Le module exemple Contacts reste inactif tant que le propriétaire ne l'approuve pas."
