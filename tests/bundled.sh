@@ -120,3 +120,50 @@ curl -fsS "$BASE/assets/js/animation.js" | grep -q 'DOMContentLoaded'
 curl -fsS -H "Cookie: $COOKIE" "$BASE/admin" >"$TMP/admin-html"
 if grep -q '/assets/js/animation.js' "$TMP/admin-html"; then exit 1; fi
 echo 'OAuth MCP, shared contacts, reviewed HTML/CSS/JS patch OK'
+
+# V0.6: owner selects approval policy once; same OAuth client deploys and restores.
+test "$(curl -fsS -H "Cookie: $COOKIE" "$BASE/admin?connections=1" | grep -c 'Validation des développements')" -ge 1
+rpc '{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"cms_site_info","arguments":{}}}' >"$TMP/info"
+php -r '$j=json_decode(file_get_contents($argv[1]),true)["result"]["structuredContent"];if($j["approval_mode"]!=="cms"||$j["remote_deploy"]!==false)exit(1);' "$TMP/info"
+# New version of the already active JavaScript, to verify automatic reactivation on rollback.
+OLD_SHA=$(php -r 'echo hash_file("sha256",$argv[1]);' "$TMP/site/assets/js/animation.js")
+php -r 'echo json_encode(["jsonrpc"=>"2.0","id"=>51,"method"=>"tools/call","params"=>["name"=>"cg_prepare_patch","arguments"=>["summary"=>"Update animation remotely","files"=>[["path"=>"assets/js/animation.js","expected_sha256"=>$argv[1],"content"=>"document.body.dataset.version=\"remote\";"]]]]]);' "$OLD_SHA" >"$TMP/remote-patch"
+rpc "$(cat "$TMP/remote-patch")" >"$TMP/remote-prepared"
+REMOTE=$(php -r '$j=json_decode(file_get_contents($argv[1]),true);echo $j["result"]["structuredContent"]["id"]??"";' "$TMP/remote-prepared")
+test -n "$REMOTE"
+release_rpc(){ rpc "$(php -r 'echo json_encode(["jsonrpc"=>"2.0","id"=>52,"method"=>"tools/call","params"=>["name"=>$argv[1],"arguments"=>["id"=>$argv[2],$argv[3]=>$argv[4]]]]);' "$1" "$2" "$3" "$4")"; }
+release_rpc cg_review_release "$REMOTE" operation deploy >"$TMP/remote-review"
+REMOTE_FP=$(php -r '$j=json_decode(file_get_contents($argv[1]),true)["result"]["structuredContent"];if(!$j["validation"]["valid"])exit(1);echo $j["fingerprint"];' "$TMP/remote-review")
+test -n "$REMOTE_FP"
+release_rpc cg_deploy_patch "$REMOTE" fingerprint "$REMOTE_FP" | grep -q '"isError":true'
+test "$(php -r 'echo hash_file("sha256",$argv[1]);' "$TMP/site/assets/js/animation.js")" = "$OLD_SHA"
+# Delegation cannot be enabled without the owner password and explicit consent.
+test "$(curl -s -o /dev/null -w '%{http_code}' -H "Cookie: $COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=ai_approval_mode' --data-urlencode 'approval_mode=chat' --data-urlencode 'accept_delegation=1' --data-urlencode 'owner_password=wrong' "$BASE/admin")" = 403
+test "$(curl -s -o /dev/null -w '%{http_code}' -H "Cookie: $COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=ai_approval_mode' --data-urlencode 'approval_mode=chat' --data-urlencode 'owner_password=cms-password-123456' "$BASE/admin")" = 400
+set_mode(){ curl -fsS -H "Cookie: $COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=ai_approval_mode' --data-urlencode "approval_mode=$1" --data-urlencode 'accept_delegation=1' --data-urlencode 'owner_password=cms-password-123456' "$BASE/admin" >/dev/null; }
+set_mode chat
+release_rpc cg_deploy_patch "$REMOTE" fingerprint "$(printf '0%.0s' {1..64})" | grep -q '"isError":true'
+release_rpc cg_deploy_patch "$REMOTE" fingerprint "$REMOTE_FP" >"$TMP/deployed-remote"
+php -r '$j=json_decode(file_get_contents($argv[1]),true)["result"]["structuredContent"];if($j["status"]!=="deployed"||$j["approval_mode"]!=="chat"||$j["human_approval_verified"]!==false)exit(1);' "$TMP/deployed-remote"
+curl -fsS "$BASE/assets/js/animation.js" | grep -q 'dataset.version'
+release_rpc cg_deploy_patch "$REMOTE" fingerprint "$REMOTE_FP" | grep -q '"isError":true'
+release_rpc cg_review_release "$REMOTE" operation rollback >"$TMP/rollback-review"
+ROLL_FP=$(php -r '$j=json_decode(file_get_contents($argv[1]),true);echo $j["result"]["structuredContent"]["fingerprint"]??"";' "$TMP/rollback-review")
+test -n "$ROLL_FP"
+release_rpc cg_rollback_patch "$REMOTE" fingerprint "$ROLL_FP" | grep -q '"status":"rolled_back"'
+curl -fsS "$BASE/assets/js/animation.js" | grep -q 'DOMContentLoaded'
+test "$(php -r 'echo hash_file("sha256",$argv[1]);' "$TMP/site/assets/js/animation.js")" = "$OLD_SHA"
+set_mode auto
+rpc '{"jsonrpc":"2.0","id":53,"method":"tools/call","params":{"name":"cg_prepare_patch","arguments":{"summary":"Add autonomous test stylesheet","files":[{"path":"assets/css/autonomy.css","expected_sha256":"","content":"body{letter-spacing:0.01em}"}]}}}' >"$TMP/auto-prepared"
+AUTO=$(php -r '$j=json_decode(file_get_contents($argv[1]),true);echo $j["result"]["structuredContent"]["id"]??"";' "$TMP/auto-prepared")
+test -n "$AUTO"
+release_rpc cg_review_release "$AUTO" operation deploy >"$TMP/auto-review"
+AUTO_FP=$(php -r '$j=json_decode(file_get_contents($argv[1]),true);echo $j["result"]["structuredContent"]["fingerprint"]??"";' "$TMP/auto-review")
+test -n "$AUTO_FP"
+release_rpc cg_deploy_patch "$AUTO" fingerprint "$AUTO_FP" | grep -q '"approval_mode":"auto"'
+curl -fsS "$BASE/assets/css/autonomy.css" | grep -q 'letter-spacing'
+curl -fsS -H "Cookie: $COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=ai_profile' --data-urlencode 'profile=manage' "$BASE/admin" >/dev/null
+rpc '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"cms_site_info","arguments":{}}}' >"$TMP/info-end"
+php -r '$j=json_decode(file_get_contents($argv[1]),true)["result"]["structuredContent"];if($j["approval_mode"]!=="cms"||$j["remote_deploy"]!==false)exit(1);' "$TMP/info-end"
+release_rpc cg_rollback_patch "$AUTO" fingerprint "$AUTO_FP" | grep -q '"isError":true'
+echo 'V0.6 approval policies, fingerprint binding, remote deployment and rollback OK'
