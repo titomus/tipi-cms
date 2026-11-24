@@ -73,6 +73,7 @@ function tipiDevDirs(): array {return ['app/McpActions','app/Controllers','app/V
 function tipiDevPath(string $path): bool {
     if(!preg_match('~^[A-Za-z0-9/_-]+\.[a-z]+$~D',$path))return false;
     $dir=dirname($path);$ext=pathinfo($path,PATHINFO_EXTENSION);
+    if($dir==='app/McpActions'&&!preg_match('~^[A-Za-z][A-Za-z0-9_]*\.php$~D',basename($path)))return false;
     return in_array($dir,tipiDevDirs(),true)&&in_array($ext,match($dir){
         'app/McpActions','app/Controllers','app/Views','app/Services','app/Components'=>['php'],
         'app/Routes'=>['json'],'themes/layouts','themes/templates','themes/components'=>['html'],
@@ -149,6 +150,14 @@ final class TipiWebContext {
         $f=tipiApprovedFile($this->root,$this->cfg,'app/Services/'.$name.'.php');
         if(!$f)fail('Service non approuvé',404);
         return require $f;
+    }
+    public function component(string $name,array $vars=[]): string {
+        $f=tipiApprovedFile($this->root,$this->cfg,'app/Components/'.$name.'.php');
+        if(!$f)fail('Composant non approuvé',404);
+        $render=static function(string $file,array $vars,TipiWebContext $ctx): string {
+            ob_start();try{require $file;return (string)ob_get_clean();}catch(Throwable $ex){ob_end_clean();throw $ex;}
+        };
+        return $render($f,$vars,$this);
     }
     public function csrf(): string {return csrf();}
 }
@@ -272,6 +281,10 @@ function tipiAdminAction(string $data,array $cfg,string $action,array $post): vo
         $draft=$vault->json('drafts/'.$id.'.json');
         if(!hash_equals(hash('sha256',json_encode($draft,JSON_THROW_ON_ERROR)),(string)($post['fingerprint']??'')))fail('Patch modifié : rechargez',409);
         foreach($draft['files']??[] as $entry)if(!tipiDevPath((string)($entry['path']??''))||($entry['operation']??'replace')!=='replace')fail('Fichier hors espace de développement',403);
+        foreach($draft['files']??[] as $entry)if(dirname($entry['path'])==='app/Routes'){
+            $route=json_decode($entry['content']??'',true,16,JSON_THROW_ON_ERROR);
+            if(!is_array($route)||!is_string($route['path']??null)||!preg_match('~^/(?:admin/)?apps/[a-z0-9][a-z0-9-]{0,70}$~D',$route['path'])||!is_string($route['handler']??null)||dirname($route['handler'])!=='app/Controllers'||!tipiDevPath($route['handler'])||!is_string($route['title']??null))fail('Déclaration de route invalide');
+        }
         $result=$cg['workspace']->validate($id);if(empty($result['valid']))fail('Le patch ne passe pas les contrôles');
         $cg['workspace']->deploy($id,true);
         // The owner explicitly approved the code shown in this exact patch.
