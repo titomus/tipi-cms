@@ -167,3 +167,35 @@ rpc '{"jsonrpc":"2.0","id":54,"method":"tools/call","params":{"name":"cms_site_i
 php -r '$j=json_decode(file_get_contents($argv[1]),true)["result"]["structuredContent"];if($j["approval_mode"]!=="cms"||$j["remote_deploy"]!==false)exit(1);' "$TMP/info-end"
 release_rpc cg_rollback_patch "$AUTO" fingerprint "$AUTO_FP" | grep -q '"isError":true'
 echo 'V0.6 approval policies, fingerprint binding, remote deployment and rollback OK'
+
+# V0.7: enable build again, allow remote patches, then trash & restore a published page with draft.
+curl -fsS -H "Cookie: $COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=ai_profile' --data-urlencode 'profile=build' --data-urlencode 'accept_php=1' "$BASE/admin" >/dev/null
+set_mode chat
+rpc '{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"cms_list_pages","arguments":{}}}' >"$TMP/pages"
+STATE=$(php -r '$j=json_decode(file_get_contents($argv[1]),true);foreach($j["result"]["structuredContent"]["pages"] as $p)if($p["slug"]==="home")echo $p["state_sha256"];' "$TMP/pages")
+test -n "$STATE"
+doc_rpc(){ rpc "$(php -r 'echo json_encode(["jsonrpc"=>"2.0","id"=>71,"method"=>"tools/call","params"=>["name"=>$argv[1],"arguments"=>["slug"=>"home",$argv[2]=>$argv[3]]]]);' "$1" "$2" "$3")"; }
+doc_rpc cms_delete_page state_sha256 "$(printf '0%.0s' {1..64})" | grep -q '"isError":true'
+doc_rpc cms_delete_page state_sha256 "$STATE" >"$TMP/trashed"
+REV=$(php -r '$j=json_decode(file_get_contents($argv[1]),true);echo $j["result"]["structuredContent"]["documents"]["home"]["revision"]??"";' "$TMP/trashed")
+test -n "$REV"
+test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/")" = 404
+rpc '{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{"name":"cms_list_trash","arguments":{}}}' | grep -q "$REV"
+doc_rpc cms_restore_page revision "$REV" | grep -q '"status":"restored"'
+curl -fsS "$BASE/" | grep -q 'Custom hero'
+SHA_DEL=$(php -r 'echo hash_file("sha256",$argv[1]);' "$TMP/site/assets/css/autonomy.css")
+rpc "$(php -r 'echo json_encode(["jsonrpc"=>"2.0","id"=>73,"method"=>"tools/call","params"=>["name"=>"cg_prepare_delete","arguments"=>["summary"=>"Remove test stylesheet","files"=>[["path"=>"assets/css/autonomy.css","expected_sha256"=>$argv[1]]]]]]);' "$SHA_DEL")" >"$TMP/delete-patch"
+DEL=$(php -r '$j=json_decode(file_get_contents($argv[1]),true);echo $j["result"]["structuredContent"]["id"]??"";' "$TMP/delete-patch")
+test -n "$DEL"
+release_rpc cg_review_release "$DEL" operation deploy >"$TMP/delete-review"
+DEL_FP=$(php -r '$j=json_decode(file_get_contents($argv[1]),true);echo $j["result"]["structuredContent"]["fingerprint"]??"";' "$TMP/delete-review")
+test -n "$DEL_FP"
+release_rpc cg_deploy_patch "$DEL" fingerprint "$DEL_FP" | grep -q '"status":"deployed"'
+test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/assets/css/autonomy.css")" = 404
+release_rpc cg_review_release "$DEL" operation rollback >"$TMP/delete-rollback"
+DEL_ROLL=$(php -r '$j=json_decode(file_get_contents($argv[1]),true);echo $j["result"]["structuredContent"]["fingerprint"]??"";' "$TMP/delete-rollback")
+test -n "$DEL_ROLL"
+release_rpc cg_rollback_patch "$DEL" fingerprint "$DEL_ROLL" | grep -q '"status":"rolled_back"'
+curl -fsS "$BASE/assets/css/autonomy.css" | grep -q 'letter-spacing'
+curl -fsS -H "Cookie: $COOKIE" "$BASE/admin/apps/contacts" | grep -q 'mcp@example.test'
+echo 'V0.7 trash, content restore and reversible extension deletion OK'
