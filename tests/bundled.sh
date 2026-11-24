@@ -198,4 +198,20 @@ test -n "$DEL_ROLL"
 release_rpc cg_rollback_patch "$DEL" fingerprint "$DEL_ROLL" | grep -q '"status":"rolled_back"'
 curl -fsS "$BASE/assets/css/autonomy.css" | grep -q 'letter-spacing'
 curl -fsS -H "Cookie: $COOKIE" "$BASE/admin/apps/contacts" | grep -q 'mcp@example.test'
-echo 'V0.7 trash, content restore and reversible extension deletion OK'
+# Bulk removal must fail as a whole on a stale item, and preserve both draft/live snapshots.
+rpc '{"jsonrpc":"2.0","id":75,"method":"tools/call","params":{"name":"cms_publish","arguments":{"slug":"blog/reset-test","raw":"---\ntitle: Published reset test\n---\nPublished body","expected_sha256":""}}}' >"$TMP/published-reset"
+PUB=$(php -r '$j=json_decode(file_get_contents($argv[1]),true);echo $j["result"]["structuredContent"]["sha256"]??"";' "$TMP/published-reset")
+test -n "$PUB"
+rpc "$(php -r 'echo json_encode(["jsonrpc"=>"2.0","id"=>76,"method"=>"tools/call","params"=>["name"=>"cms_save_draft","arguments"=>["slug"=>"blog/reset-test","raw"=>"---\ntitle: Draft reset test\n---\nDraft body","expected_sha256"=>$argv[1]]]]);' "$PUB")" | grep -q '"isError":false'
+rpc '{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"cms_list_pages","arguments":{}}}' >"$TMP/bulk-pages"
+php -r '$j=json_decode(file_get_contents($argv[1]),true);$p=[];foreach($j["result"]["structuredContent"]["pages"] as $x)if(in_array($x["slug"],["home","blog/reset-test"],true))$p[]=["slug"=>$x["slug"],"state_sha256"=>$x["state_sha256"]];if(count($p)!==2)exit(1);$r=["jsonrpc"=>"2.0","id"=>78,"method"=>"tools/call","params"=>["name"=>"cms_delete_pages","arguments"=>["pages"=>$p]]];file_put_contents($argv[2],json_encode($r));$r["params"]["arguments"]["pages"][1]["state_sha256"]=str_repeat("0",64);file_put_contents($argv[3],json_encode($r));' "$TMP/bulk-pages" "$TMP/bulk-ok" "$TMP/bulk-bad"
+rpc "$(cat "$TMP/bulk-bad")" | grep -q '"isError":true'
+curl -fsS "$BASE/blog/reset-test" | grep -q 'Published body'
+rpc "$(cat "$TMP/bulk-ok")" >"$TMP/bulk-result"
+REV2=$(php -r '$j=json_decode(file_get_contents($argv[1]),true)["result"]["structuredContent"];if($j["count"]!==2)exit(1);echo $j["documents"]["blog/reset-test"]["revision"];' "$TMP/bulk-result")
+test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/blog/reset-test")" = 404
+test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/")" = 404
+rpc "$(php -r 'echo json_encode(["jsonrpc"=>"2.0","id"=>79,"method"=>"tools/call","params"=>["name"=>"cms_restore_page","arguments"=>["slug"=>"blog/reset-test","revision"=>$argv[1]]]]);' "$REV2")" | grep -q '"status":"restored"'
+curl -fsS "$BASE/blog/reset-test" | grep -q 'Published body'
+rpc '{"jsonrpc":"2.0","id":80,"method":"tools/call","params":{"name":"cms_read_page","arguments":{"slug":"blog/reset-test"}}}' | grep -q 'Draft body'
+echo 'V0.7 trash, bulk deletion, both content versions and reversible extension deletion OK'
