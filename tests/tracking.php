@@ -77,6 +77,44 @@ try{
         throw new LogicException('Expected outage');
     } catch(RuntimeException $ex){expect($ex->getCode()===503,'Synchronization failure surfaced');}
     expect(tipiHubStatus($d)['hector_sync']['count']===1&&tipiHubConfig($d)['hector_sequence']===2,'Keep last confirmed state, reserve next sequence');
+    $new=['id'=>str_repeat('d',32),'slug'=>'blog/hector-test','expected_revision'=>'','mode'=>'publish',
+        'fields'=>['title'=>'Hector test','seo_title'=>'SEO','meta_description'=>'Meta','author_name'=>'Auteur','category_name'=>'Cat','content_markdown'=>'A [link](/services).']];
+    try{tipiHectorApply($d,$new,$token);throw new LogicException('Expected opt-in rejection');}
+    catch(RuntimeException $ex){expect($ex->getCode()===403,'Explicit opt-in required');}
+    tipiHectorWriteSettings($d,true);
+    $first=tipiHectorApply($d,$new,$token);
+    expect($first['status']==='applied'&&$first['mode']==='publish','Native publication');
+    expect(tipiHectorApply($d,$new,$token)===$first,'Replay returns identical receipt');
+    $raw=loadDoc($d,'blog/hector-test','published');[$meta,$body]=front($raw);
+    expect($meta['seo_title']==='SEO'&&$meta['author']==='Auteur'&&$meta['category']==='Cat','Editorial metadata');
+    $change=['id'=>str_repeat('e',32),'slug'=>'blog/hector-test','expected_revision'=>sha($raw),'mode'=>'draft','fields'=>['seo_title'=>'New SEO']];
+    tipiHectorApply($d,$change,$token);
+    expect(loadDoc($d,'blog/hector-test','published')===$raw,'Draft preserves live publication');
+    expect(front(loadDoc($d,'blog/hector-test','drafts'))[0]['id']===$meta['id'],'Stable document identity');
+    $conflict=array_replace($change,['id'=>str_repeat('f',32),'mode'=>'publish']);
+    try{tipiHectorApply($d,$conflict,$token);throw new LogicException('Expected conflict');}
+    catch(RuntimeException $ex){expect($ex->getCode()===409,'Existing human draft protected');}
+    $dynamic=array_replace($new,['id'=>str_repeat('0',32),'slug'=>'blog/dynamic','fields'=>['title'=>'Dynamic','content_markdown'=>'{{component}}']]);
+    try{tipiHectorApply($d,$dynamic,$token);throw new LogicException('Expected dynamic rejection');}
+    catch(RuntimeException $ex){expect($ex->getCode()===422,'Dynamic content rejected');}
+    // Exercise polling, full inventory refresh and acknowledgement recovery.
+    $queued=array_replace($new,['id'=>str_repeat('9',32),'slug'=>'blog/poll']);
+    $ackAttempts=0;$polls=0;
+    $transport=function($method,$path,$payload,$headers)use($queued,&$ackAttempts,&$polls){
+        if($path==='hector/cms/inventory')return ['inventory'=>['platform'=>'tipi_cms','mode'=>'read_only','sequence'=>$payload['sequence'],'count'=>count($payload['documents']),'articles'=>count($payload['documents'])]];
+        if(isset($payload['receipt'])){
+            $ackAttempts++;
+            if($ackAttempts===1)fail('Lost acknowledgement',503);
+            return ['commands'=>['acknowledged'=>$payload['receipt']['id']]];
+        }
+        $polls++;return ['commands'=>['command'=>$queued]];
+    };
+    try{tipiHectorRun($d,$cfg,$transport);throw new LogicException('Expected lost acknowledgement');}
+    catch(RuntimeException $ex){expect($ex->getCode()===503,'Transport error surfaced');}
+    $written=loadDoc($d,'blog/poll','published');
+    $retry=tipiHectorRun($d,$cfg,$transport);
+    expect($retry['command']['status']==='applied'&&$ackAttempts===2&&$polls===1,'Retry ack before new poll');
+    expect(loadDoc($d,'blog/poll','published')===$written,'No duplicate publication');
     tipiHubPairing($d,$cfg,'hub_refresh',$request);
     expect($calls[2][3]===['Authorization: Bearer '.$token],'Authenticated refresh');
     try {
