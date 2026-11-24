@@ -493,6 +493,7 @@ function validateEditorialHtml(string $html,bool $allowDynamic=true): string {
             if(!$node instanceof DOMElement||!in_array($tag=strtolower($node->tagName),$allowed,true))fail('Balise HTML non autorisée',422);
             foreach($node->attributes as $attr){
                 $key=strtolower($attr->name);$value=$attr->value;
+                if(str_contains($value,'<!--tipi:')||str_contains($value,'{{'))fail('Composant interdit dans un attribut',422);
                 if(in_array($key,['href','src'],true)){
                     if(($key==='href'&&$tag!=='a')||($key==='src'&&!in_array($tag,['img','iframe'],true)))fail('Attribut URL interdit',422);
                     if($value===''||preg_match('~[\x00-\x20\x7f\\\\]~',$value)||str_starts_with($value,'//')||
@@ -1109,7 +1110,7 @@ function publicPage(string $d,array $cfg,string $slug,bool $preview=false): void
     $html=($m['format']??'markdown')==='html'
         ?preg_replace_callback('~<!--tipi:(list:blog|component:[A-Za-z0-9_-]+|include:partials/[a-z0-9-]+\.md)-->~',fn($match)=>renderBody($d,'{{'.$match[1].'}}',$preview?[]:$cfg),$body)
         :renderBody($d,$body,$preview?[]:$cfg);
-    if (!preg_match('~<h1>~i',$html)) $html='<h1>'.e($m['title']).'</h1>'.$html;
+    if (!preg_match('~<h1(?:\s|>)~i',$html)) $html='<h1>'.e($m['title']).'</h1>'.$html;
     if($preview) $html='<p class="panel">Prévisualisation privée</p>'.$html;
     shell($title,$html,$head,navFor($d),$cfg['name'],$preview?[]:$cfg,$m['template']??'');
 }
