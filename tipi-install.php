@@ -850,7 +850,7 @@ function main(): void {
     }
     if($installed&&str_starts_with($path,'/assets/')&&tipiAsset($path,$cfg))return;
     if($installed&&(str_starts_with($path,'/apps/')||str_starts_with($path,'/admin/apps/'))&&tipiAppRoute($path,$d,$cfg))return;
-    if(str_starts_with($path,'/tipi-install')){http_response_code(404);return;}
+    if(str_starts_with($path,'/tipi-install')||preg_match('~^/codegraft(?:-api)?(?:/|$)~D',$path)){http_response_code(404);return;}
     if($path==='/admin'||$path==='/admin/') {admin($d,$cfg);return;}
     if(str_starts_with($path,'/api/'))api($d,$cfg,$path);
     if($path==='/mcp'||$path==='/mcp/')mcp($d,$cfg);
