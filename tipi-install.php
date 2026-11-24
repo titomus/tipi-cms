@@ -345,7 +345,7 @@ final class MiniMarkdown {
   }
 }
 
-const TIPI_VERSION = '0.7.0-preview';
+const TIPI_VERSION = '0.8.0-preview';
 const TIPI_SETUP_HASH = '';
 const MAX_CONTENT = 262144;
 
@@ -573,14 +573,176 @@ function changeDesign(string $d,array $values,string $expected): array {
         return ['design'=>siteDesign($c),'sha256'=>designHash($c),'revision'=>$rev];
     });
 }
+// Native Tipi integration: independent of editable themes and extensions.
+const TIPI_ANALYTICS_ORIGIN='https://analitycs.le-tipi.club';
+const TIPI_OPTIMIZE_ORIGIN='https://optimize.le-tipi.club';
+function tipiHubConfig(string $d): array {return jread($d.'/hub.json');}
+function tipiHubEnabled(array $h): bool {return ($h['analytics']??false)===true&&is_string($h['tracker_key']??null)&&preg_match('~^[a-zA-Z0-9_-]{16,128}$~D',$h['tracker_key'])===1;}
+function tipiHubBinding(array $h): string {return substr(hash('sha256',($h['installation_uid']??'').'|'.($h['tracker_key']??'').'|'.(!empty($h['optimize'])?'1':'0')),0,32);}
+function tipiHubConsent(array $h): bool {return tipiHubEnabled($h)&&hash_equals(tipiHubBinding($h).'.yes',(string)($_COOKIE['tipi_metrics_consent']??''));}
+function tipiHubStatus(string $d): array {
+    $h=tipiHubConfig($d);
+    return ['mode'=>tipiHubEnabled($h)?'manual':'disconnected','analytics'=>tipiHubEnabled($h),'optimize'=>tipiHubEnabled($h)&&!empty($h['optimize']),'consent'=>'explicit_opt_in','html_contract'=>'data-ta-event / data-ta-revenue / data-ta-meta-*','javascript'=>'Tipi.track(name, meta) delegates to TipiAnalitycs.event','php'=>'Tipi::track(name, meta, stable_reference) queues confirmed public POST events after consent','server_queue_pending'=>count(glob($d.'/hub-outbox/*.json')?:[]),'pairing_ready'=>false,'revenue_provider_ready'=>false];
+}
+function tipiHubSettings(string $d,array $post): void {
+    $key=trim((string)($post['tracker_key']??''));
+    if($key!==''&&!preg_match('~^[a-zA-Z0-9_-]{16,128}$~D',$key))fail('Clé de suivi invalide');
+    locked($d,function()use($d,$post,$key){
+        $h=tipiHubConfig($d);
+        if(($post['action']??'')==='hub_disconnect'){
+            $h['analytics']=false;$h['optimize']=false;$h['tracker_key']='';
+        }else{
+            $h['tracker_key']=$key!==''?$key:($h['tracker_key']??'');
+            $h['analytics']=isset($post['analytics']);$h['optimize']=$h['analytics']&&isset($post['optimize']);
+            if($h['analytics']&&!tipiHubEnabled($h))fail('Clé de suivi nécessaire');
+        }
+        $h['installation_uid']=$h['installation_uid']??bin2hex(random_bytes(16));
+        jwrite($d.'/hub.json',$h);
+    });
+}
+function tipiHubPanel(string $d): string {
+    $h=tipiHubConfig($d);$status=tipiHubStatus($d);
+    return '<h1>Le Tipi</h1><div class="panel"><h2>'.(tipiHubEnabled($h)?'Suivi configuré':'Connecter votre site').'</h2><p>Configuration locale provisoire. Récupérez la clé publique du site dans le Tipi Hub. L’association en un clic sera ajoutée côté Hub ultérieurement.</p><form method="post">'.csrf().'<label>Clé publique Analytics (laisser vide pour conserver)<input name="tracker_key" autocomplete="off" placeholder="'.(!empty($h['tracker_key'])?'Clé enregistrée':'Clé du site').'"></label><label><input style="display:inline;width:auto" type="checkbox" name="analytics" '.(!empty($h['analytics'])?'checked':'').'> Activer Analytics sur le site public</label><label><input style="display:inline;width:auto" type="checkbox" name="optimize" '.(!empty($h['optimize'])?'checked':'').'> Activer Optimize après consentement</label><p>Le suivi reste désactivé tant que le visiteur n’a pas accepté. L’administration et les prévisualisations sont exclues.</p><button name="action" value="hub_save">Enregistrer</button><button class="secondary" name="action" value="hub_disconnect">Déconnecter</button></form></div><h2>Événements métier</h2><p>'.(int)$status['server_queue_pending'].' événement(s) PHP en attente. Les clics HTML et événements JS utilisent directement le tracker existant.</p><form method="post">'.csrf().'<button name="action" value="hub_flush" class="secondary">Réessayer les envois PHP</button></form><p><a href="https://le-tipi.club/dashboard">Ouvrir le Tipi Hub</a></p><p>La réception des événements n’est pas confirmée par la simple présence de la clé. Vérifiez le flux temps réel du Hub.</p>';
+}
+function tipiHubRender(string $html,array $cfg): string {
+    $h=tipiHubConfig(dataDir());if(!tipiHubEnabled($h))return $html;
+    // No public tracking on admin/preview; shell calls this only with public design config.
+    header('Cache-Control: private, no-store');header('Vary: Cookie',false);
+    $consented=tipiHubConsent($h);$binding=tipiHubBinding($h);
+    $script='<script defer src="/tipi-metrics.js" data-tipi-consent="'.e($binding).'" data-tipi-enabled="'.($consented?'1':'0').'"></script>';
+    if($consented){
+        $origins=TIPI_ANALYTICS_ORIGIN.(!empty($h['optimize'])?' '.TIPI_OPTIMIZE_ORIGIN:'');
+        header("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https:; frame-src https://www.youtube-nocookie.com; script-src 'self' ".$origins."; connect-src 'self' ".$origins."; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+        $script.='<script defer src="'.TIPI_ANALYTICS_ORIGIN.'/tracker.js" data-site-key="'.e($h['tracker_key']).'" data-cookie-domain="'.e((string)parse_url($cfg['url'],PHP_URL_HOST)).'" data-disable-optimize="1" data-disable-payments="1" data-disable-url-revenue="1"></script>';
+        if(!empty($h['optimize']))$script.='<script defer src="'.TIPI_OPTIMIZE_ORIGIN.'/optimize.js" data-site-key="'.e($h['tracker_key']).'"></script>';
+    }
+    $decision=(string)($_COOKIE['tipi_metrics_consent']??'');
+    $panel='<aside id="tipi-metrics-consent" style="position:fixed;bottom:12px;right:12px;z-index:2147483647;max-width:min(390px,calc(100vw - 24px));padding:14px;background:#fff;color:#182c23;border:1px solid #bbb;border-radius:8px;font:14px/1.5 system-ui">';
+    if($consented||hash_equals($binding.'.no',$decision))$panel.='<button type="button" data-tipi-consent-choice="reset">Préférences de mesure d’audience</button>';
+    else $panel.='<p>Autorisez-vous la mesure d’audience'.(!empty($h['optimize'])?' et les tests de présentation':'').' ? Le site reste utilisable sans ces mesures.</p><button type="button" data-tipi-consent-choice="yes">Accepter</button><button type="button" data-tipi-consent-choice="no">Refuser</button>';
+    $panel.='</aside>';
+    // Inject after theme rendering, including custom layouts. The SDK precedes theme scripts.
+    $head=preg_replace_callback('~<head(?:\s[^>]*)?>~i',static fn($m)=>$m[0].$script,$html,1,$n);
+    $html=$n?$head:$script.$html;
+    $body=preg_replace_callback('~</body\s*>~i',static fn($m)=>$panel.$m[0],$html,1,$n);
+    return $n?$body:$html.$panel;
+}
+function tipiMetricsJs(): string {
+    return <<<'JS'
+(function () {
+  'use strict';
+  var script = document.currentScript;
+  // document.currentScript is available for classic deferred scripts.
+  if (!script) return;
+  var binding = script.getAttribute('data-tipi-consent') || '';
+  var enabled = script.getAttribute('data-tipi-enabled') === '1';
+  function clearTrackerState() {
+    var keys = ['ta_visitor_id','ta_session_id','ta_first_touch','ta_current_touch','ta_identity','ta_last_pageview','ta_last_identify','ta_url_revenue_events','ta_element_revenue_events','ta_auto_conversion_events','ta_tracker_rule_config','ta_event_queue'];
+    keys.forEach(function (key) {
+      try { localStorage.removeItem(key); sessionStorage.removeItem(key); } catch (_) {}
+      document.cookie = key + '=; Max-Age=0; Path=/; SameSite=Lax';
+      document.cookie = key + '=; Max-Age=0; Path=/; SameSite=Lax; Domain=' + location.hostname;
+    });
+  }
+  function choose(value) {
+    if (value !== 'yes') clearTrackerState();
+    document.cookie = 'tipi_metrics_consent=' + encodeURIComponent(binding + '.' + value) + '; Path=/; Max-Age=' + (value === 'reset' ? 0 : 15552000) + '; SameSite=Lax' + (location.protocol === 'https:' ? '; Secure' : '');
+    location.reload();
+  }
+  document.addEventListener('click', function (event) {
+    var button = event.target.closest && event.target.closest('#tipi-metrics-consent [data-tipi-consent-choice]');
+    if (button) choose(button.getAttribute('data-tipi-consent-choice'));
+  });
+  window.Tipi = window.Tipi || {};
+  window.Tipi.track = function (name, meta) {
+    if (!enabled || typeof name !== 'string' || !/^[a-z][a-z0-9_.-]{0,63}$/.test(name) || /^(revenue|identify|pageview|heartbeat)$/.test(name)) return false;
+    var clean = {};
+    Object.keys(meta || {}).slice(0, 15).forEach(function (key) {
+      var value = meta[key];
+      if (!/^[a-z][a-z0-9_-]{0,39}$/i.test(key) || /email|phone|address|identity|visitor|session|token|password|provider|revenue_kind|event_uid|original_event/i.test(key)) return;
+      if (typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value)) || (typeof value === 'string' && /^[a-zA-Z0-9_.-]{1,80}$/.test(value))) clean[key] = value;
+    });
+    if (Object.prototype.hasOwnProperty.call(clean, 'value')) { clean.revenue_kind = 'estimated'; clean.is_estimated = true; }
+    var api = window.TipiAnalitycs = window.TipiAnalitycs || {q: []};
+    if (typeof api.event === 'function') api.event(name, clean);
+    else if (Array.isArray(api.q) && api.q.length < 50) api.q.push(['event', name, clean]);
+    else return false;
+    return true;
+  };
+})();
+JS;
+}
+function tipiMetricsAsset(): void {
+    if(!in_array($_SERVER['REQUEST_METHOD']??'GET',['GET','HEAD'],true)){http_response_code(405);return;}
+    header('Content-Type: application/javascript; charset=utf-8');header('Cache-Control: no-cache');
+    if(($_SERVER['REQUEST_METHOD']??'GET')==='GET')echo tipiMetricsJs();
+}
+final class Tipi {
+    // Call only AFTER the business transaction succeeded. No automatic POST-to-conversion mapping.
+    public static function track(string $name,array $meta=[],string $reference=''): bool {
+        try{
+            $path=explode('?',(string)($_SERVER['REQUEST_URI']??''),2)[0];
+            if(($_SERVER['REQUEST_METHOD']??'')!=='POST'||!preg_match('~^/apps/[a-z0-9][a-z0-9-]{0,70}$~D',$path))return false;
+            if(!preg_match('~^[a-z][a-z0-9_.-]{0,63}$~D',$name)||in_array($name,['revenue','identify','pageview','heartbeat'],true))return false;
+            $d=dataDir();$h=tipiHubConfig($d);if(!tipiHubConsent($h))return false;
+            $visitor=(string)($_COOKIE['ta_visitor_id']??'');$session=(string)($_COOKIE['ta_session_id']??'');
+            if(!preg_match('~^[a-zA-Z0-9_-]{8,80}$~D',$visitor))return false;
+            if(!preg_match('~^[a-zA-Z0-9_-]{8,80}$~D',$session))$session='';
+            $clean=[];
+            foreach(array_slice($meta,0,15,true) as $k=>$v){
+                if(!is_string($k)||!preg_match('~^[a-z][a-z0-9_-]{0,39}$~iD',$k)||preg_match('~email|phone|address|identity|visitor|session|token|password|provider|revenue_kind|event_uid|original_event~i',$k))continue;
+                if(is_bool($v)||is_int($v)||(is_float($v)&&is_finite($v))||(is_string($v)&&preg_match('~^[a-zA-Z0-9_.-]{1,80}$~D',$v)))$clean[$k]=$v;
+            }
+            if(isset($clean['value'])){$clean['revenue_kind']='estimated';$clean['is_estimated']=true;}
+            $clean['name']=$name;$clean['original_event']=$name;$clean['category']='custom';$clean['source']='tipi_cms_php';
+            $binding=tipiHubBinding($h);$uid=hash('sha256',$binding.'|'.$name.'|'.($reference!==''?$reference:bin2hex(random_bytes(16))));
+            $cfg=jread($d.'/config.json');
+            $row=['binding'=>$binding,'payload'=>['event_uid'=>$uid,'event_name'=>'event','visitor_id'=>$visitor,'session_id'=>$session?:null,'ts'=>time(),'url'=>$cfg['url'].$path,'path'=>$path,'meta'=>$clean]];
+            $ok=locked($d,function()use($d,$row,$uid,$binding){
+                if(!hash_equals($binding,tipiHubBinding(tipiHubConfig($d)))||!tipiHubEnabled(tipiHubConfig($d)))return false;
+                $file=$d.'/hub-outbox/'.$uid.'.json';
+                if(is_file($file))return true;
+                if(count(glob($d.'/hub-outbox/*.json')?:[])>=500)return false;
+                jwrite($file,$row);return true;
+            });
+            if($ok){static $scheduled=false;if(!$scheduled){$scheduled=true;register_shutdown_function(static function()use($d){try{tipiHubFlush($d,1);}catch(Throwable $ex){error_log('Tipi CMS: événement en attente');}});}}
+            return $ok;
+        }catch(Throwable $ex){error_log('Tipi CMS: événement métier non enregistré');return false;}
+    }
+}
+function tipiHubFlush(string $d,int $limit=10): array {
+    $h=tipiHubConfig($d);if(!tipiHubEnabled($h)||!function_exists('curl_init'))return ['sent'=>0,'status'=>'disabled_or_curl_missing'];
+    $lock=fopen($d.'/hub-outbox.lock','c');if(!$lock)return ['sent'=>0,'status'=>'busy'];
+    $sent=0;
+    try{
+        if(!flock($lock,LOCK_EX|LOCK_NB))return ['sent'=>0,'status'=>'busy'];
+        $files=glob($d.'/hub-outbox/*.json')?:[];
+        usort($files,static fn($a,$b)=>filemtime($a)<=>filemtime($b));
+        foreach(array_slice($files,0,max(1,min(20,$limit))) as $file){
+            if(is_link($file))continue;
+            $row=jread($file);$current=tipiHubConfig($d);
+            if(!tipiHubEnabled($current))break;
+            if(($row['binding']??'')!==tipiHubBinding($current)||($row['payload']['ts']??0)<time()-604800){unlink($file);continue;}
+            $payload=$row['payload'];$payload['site_key']=$current['tracker_key'];
+            $ch=curl_init(TIPI_ANALYTICS_ORIGIN.'/api/analitycs/collect');
+            curl_setopt_array($ch,[CURLOPT_POST=>true,CURLOPT_POSTFIELDS=>json_encode($payload,JSON_THROW_ON_ERROR),CURLOPT_HTTPHEADER=>['Content-Type: application/json'],CURLOPT_RETURNTRANSFER=>true,CURLOPT_CONNECTTIMEOUT_MS=>600,CURLOPT_TIMEOUT_MS=>1500,CURLOPT_FOLLOWLOCATION=>false,CURLOPT_SSL_VERIFYPEER=>true,CURLOPT_SSL_VERIFYHOST=>2]);
+            $body=curl_exec($ch);$code=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);curl_close($ch);
+            $result=is_string($body)?json_decode($body,true):null;
+            if($code>=200&&$code<300&&($result['ok']??false)===true&&($result['accepted']??0)>0){unlink($file);$sent++;}
+            else break;
+        }
+        return ['sent'=>$sent,'status'=>'attempted'];
+    }finally{flock($lock,LOCK_UN);fclose($lock);}
+}
 function shell(string $title,string $body,string $head='',string $nav='',string $brand='Tipi CMS',array $designConfig=[],string $template=''): void {
     header('Content-Type: text/html; charset=utf-8');
     $layout=match($designConfig['layout']??'classic'){'wide'=>'header,main,footer{max-width:1200px}','centered'=>'header{justify-content:center;text-align:center}main{max-width:760px}nav{width:100%}','editorial'=>'main{max-width:760px}h1,h2,h3{font-family:Georgia,serif}header{max-width:1100px}',default=>''};
     $extra=$designConfig['custom_css']??'';
     if(!is_string($extra)||preg_match('~[<>]~',$extra))$extra='';
     $style=strtr(css(),array_combine(['#176044','#244d39','#f7f8f5','#182c23'],design($designConfig))).$layout.$extra;
-    if($designConfig&&function_exists('tipiTheme')){echo tipiTheme(dataDir(),$designConfig,$head,$style,$body,$nav,$brand,$title,$template);return;}
-    echo '<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'.e($title).'</title>'.$head.'<style>'.strtr(css(),array_combine(['#176044','#244d39','#f7f8f5','#182c23'],design($designConfig))).$layout.$extra.'</style></head><body><header><strong><a href="/">'.e($brand).'</a></strong><nav>'.$nav.'</nav></header><main>'.$body.'</main><footer>Propulsé par Tipi CMS · Propulsé par Codegraft™</footer></body></html>';
+    if($designConfig&&function_exists('tipiTheme')){echo tipiHubRender(tipiTheme(dataDir(),$designConfig,$head,$style,$body,$nav,$brand,$title,$template),$designConfig);return;}
+    $html='<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'.e($title).'</title>'.$head.'<style>'.strtr(css(),array_combine(['#176044','#244d39','#f7f8f5','#182c23'],design($designConfig))).$layout.$extra.'</style></head><body><header><strong><a href="/">'.e($brand).'</a></strong><nav>'.$nav.'</nav></header><main>'.$body.'</main><footer>Propulsé par Tipi CMS · Propulsé par Codegraft™</footer></body></html>';
+    echo $designConfig?tipiHubRender($html,$designConfig):$html;
 }
 function navFor(string $d): string {
     $links=[];
@@ -679,6 +841,10 @@ function admin(string $d,array $cfg): void {
             require_once $bridge;
             tipiAdminAction($d,$cfg,$act,$_POST);redirect('/admin?connections=1');
         }
+        if(in_array($act,['hub_save','hub_disconnect','hub_flush'],true)){
+            if($act==='hub_flush')tipiHubFlush($d);else tipiHubSettings($d,$_POST);
+            redirect('/admin?hub=1');
+        }
         if($act==='design_restore'){
             $id=(string)($_POST['revision']??'');
             if(!preg_match('~^\d{14}-[a-f0-9]{12}$~D',$id))fail('Version invalide');
@@ -735,8 +901,9 @@ function admin(string $d,array $cfg): void {
         else fail('Action inconnue');
         redirect('/admin?edit='.rawurlencode($slug));
     }
-    $nav='<a href="/admin">Contenus</a><a href="/admin?settings=1">Apparence</a><a href="/admin?connections=1">Assistant IA</a><a href="/">Voir le site</a><form method="post" action="/admin" style="display:inline">'.csrf().'<button class="secondary" name="action" value="logout">Déconnexion</button></form>';
+    $nav='<a href="/admin">Contenus</a><a href="/admin?settings=1">Apparence</a><a href="/admin?connections=1">Assistant IA</a><a href="/admin?hub=1">Le Tipi</a><a href="/">Voir le site</a><form method="post" action="/admin" style="display:inline">'.csrf().'<button class="secondary" name="action" value="logout">Déconnexion</button></form>';
     if(function_exists('tipiAppNav'))$nav.=tipiAppNav(dirname(__DIR__),$cfg,true);
+    if(isset($_GET['hub'])){shell('Le Tipi',tipiHubPanel($d),'',$nav);return;}
     if(isset($_GET['settings'])){
         $choices='';foreach(['forest'=>'Forêt','ink'=>'Encre','sand'=>'Sable'] as $k=>$label)$choices.='<option value="'.$k.'" '.(($cfg['theme']??'forest')===$k?'selected':'').'>'.$label.'</option>';
         $layouts='';foreach(['classic'=>'Classique','wide'=>'Large','centered'=>'Centré','editorial'=>'Éditorial'] as $k=>$label)$layouts.='<option value="'.$k.'" '.(($cfg['layout']??'classic')===$k?'selected':'').'>'.$label.'</option>';
@@ -782,7 +949,7 @@ function api(string $d,array $cfg,string $path): never {
     $auth=$_SERVER['HTTP_AUTHORIZATION']??$_SERVER['REDIRECT_HTTP_AUTHORIZATION']??'';
     if(empty($cfg['api_hash'])||!preg_match('~^Bearer ([a-f0-9]{64})$~D',$auth,$m)||!hash_equals($cfg['api_hash'],hash('sha256',$m[1])))jsonout(['error'=>'Non autorisé'],401);
     $method=$_SERVER['REQUEST_METHOD'];
-    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','codegraft_bridge'=>is_file(dirname(__DIR__).'/tipi-system/bridge.php'),'hub'=>false]);
+    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','codegraft_bridge'=>is_file(dirname(__DIR__).'/tipi-system/bridge.php'),'hub'=>tipiHubStatus($d)]);
     if($method==='GET'&&$path==='/api/v1/pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
         foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug)),'state_sha256'=>documentState($d,$slug)];
@@ -810,6 +977,7 @@ function mcpTools(): array {
     $tool=static fn($n,$d,$schema,$ro)=>['name'=>$n,'description'=>$d,'inputSchema'=>$schema,'annotations'=>['readOnlyHint'=>$ro,'destructiveHint'=>!$ro,'openWorldHint'=>false]];
     return [
         $tool('cms_site_info','Informations et capacités du site : contenu, design et extensions métier. À consulter avant de proposer une intervention.',$empty,true),
+        $tool('cms_tracking_info','Lit le contrat de tracking natif, état local et conventions HTML/JS/PHP. Ne retourne aucune clé.',$empty,true),
         $tool('cms_get_design','Lire palette, disposition, CSS personnalisé et empreinte',$empty,true),
         $tool('cms_update_design','Modifier le design public (palette, disposition, CSS responsive) sans toucher au noyau. Utiliser le SHA de cms_get_design.',$input(['expected_sha256'=>$hash,'name'=>['type'=>'string'],'theme'=>['type'=>'string','enum'=>['forest','ink','sand']],'accent'=>['type'=>'string'],'layout'=>['type'=>'string','enum'=>['classic','wide','centered','editorial']],'custom_css'=>['type'=>'string']],['expected_sha256']),false),
         $tool('cms_list_pages','Liste les documents avec leur état et empreinte',$empty,true),
@@ -823,6 +991,7 @@ function mcpTools(): array {
     ];
 }
 function mcpCall(string $d,array $cfg,string $name,array $args): array {
+    if($name==='cms_tracking_info')return tipiHubStatus($d);
     if($name==='cms_get_design')return ['design'=>siteDesign($cfg),'sha256'=>designHash($cfg)];
     if($name==='cms_update_design'){
         if(empty($cfg['mcp_write'])||empty($cfg['mcp_publish']))fail('Modification publique désactivée',403);
@@ -914,6 +1083,7 @@ function main(): void {
         if(!is_file($bridge)||is_link($bridge)||!is_file(dirname(__DIR__).'/tipi-system/codegraft/standalone/config.php')){http_response_code(404);return;}
         require_once $bridge; tipiCodeGraftRoute($path,$d,$cfg);return;
     }
+    if($path==='/tipi-metrics.js'){tipiMetricsAsset();return;}
     if($installed&&str_starts_with($path,'/assets/')&&tipiAsset($path,$cfg))return;
     if($installed&&(str_starts_with($path,'/apps/')||str_starts_with($path,'/admin/apps/'))&&tipiAppRoute($path,$d,$cfg))return;
     if(str_starts_with($path,'/tipi-install')||preg_match('~^/codegraft(?:-api)?(?:/|$)~D',$path)){http_response_code(404);return;}
@@ -930,6 +1100,9 @@ function main(): void {
     publicPage($d,$cfg,$slug);
 }
 if (PHP_SAPI === 'cli') {
+    if(($argv[1]??'')==='--tipi-flush-events'){
+        echo json_encode(tipiHubFlush(dataDir(),20),JSON_THROW_ON_ERROR).PHP_EOL;exit;
+    }
     if(($argv[1]??'')==='--prepare'){
         $key=bin2hex(random_bytes(24));$src=(string)file_get_contents(__FILE__);
         $src=preg_replace("~const TIPI_SETUP_HASH = '[a-f0-9]*';~","const TIPI_SETUP_HASH = '".hash('sha256',$key)."';",$src,1);
