@@ -94,6 +94,7 @@ function tipiAdminAction(string $data,array $cfg,string $action,array $post): vo
         });return;
     }
     if($action==='ai_revoke'){
+        if(!password_verify((string)($post['owner_password']??''),$cfg['password_hash'])){usleep(400000);fail('Mot de passe incorrect',403);}
         $id=(string)($post['client']??'');
         if(!preg_match('~^mcp_[A-Za-z0-9_-]{10,150}$~D',$id))fail('Client invalide');
         $path=$vault->directory.'/oauth.sqlite';
@@ -127,7 +128,17 @@ function tipiAdminAction(string $data,array $cfg,string $action,array $post): vo
         foreach($draft['files']??[] as $entry)if(!preg_match('~^app/McpActions/[A-Za-z][A-Za-z0-9_]*\.php$~D',$entry['path']??'')||($entry['operation']??'replace')!=='replace')fail('Seuls les modules métier PHP sont autorisés',403);
         $result=$cg['workspace']->validate($id);if(empty($result['valid']))fail('Le patch ne passe pas les contrôles');
         $cg['workspace']->deploy($id,true);
-        // Executable code stays disabled until its exact version is separately approved.
+        // The owner explicitly approved the code shown in this exact patch.
+        // Activate only these deployed versions, never unrelated pending modules.
+        locked($data,function()use($data,$draft){
+            $c=jread($data.'/config.json');if(($c['ai_profile']??'read')!=='build')return;
+            $current=tipiBusinessManifest(dirname(__DIR__));
+            foreach($draft['files'] as $entry){
+                $file=basename($entry['path']);$hash=$entry['after_sha256'];
+                if(isset($current[$file])&&hash_equals($current[$file],$hash))$c['business_approved'][$file]=$hash;
+            }
+            jwrite($data.'/config.json',$c);
+        });
     }elseif($action==='ai_rollback')$cg['workspace']->rollback($id,true);
 }
 function tipiAdminPanel(string $data,array $cfg): string {
@@ -145,7 +156,7 @@ function tipiAdminPanel(string $data,array $cfg): string {
         $count++;
         $body.='<div class="panel"><h3>'.e((string)($draft['summary']??'Modification')).'</h3><details><summary>Vérifier les fichiers proposés</summary>';
         foreach($draft['files']??[] as $entry)$body.='<p>'.e((string)$entry['path']).'</p><pre>'.e((string)($entry['content']??'')).'</pre>';
-        $body.='</details><form method="post">'.csrf().'<input type="hidden" name="patch" value="'.$id.'"><input type="hidden" name="fingerprint" value="'.hash('sha256',json_encode($draft,JSON_THROW_ON_ERROR)).'">'.field('owner_password','Votre mot de passe','','password').'<button name="action" value="ai_deploy">Valider et installer</button></form></div>';
+        $body.='</details><form method="post">'.csrf().'<input type="hidden" name="patch" value="'.$id.'"><input type="hidden" name="fingerprint" value="'.hash('sha256',json_encode($draft,JSON_THROW_ON_ERROR)).'">'.field('owner_password','Votre mot de passe','','password').'<button name="action" value="ai_deploy">Installer et activer cette fonctionnalité</button></form></div>';
         if($count>=10)break;
     }
     if(!$count)$body.='<p>Aucune modification en attente.</p>';
@@ -167,7 +178,7 @@ function tipiAdminPanel(string $data,array $cfg): string {
     }
     $body.='<h2>Assistants connectés</h2>';
     foreach(\CodeGraft\ControlCenter::clients($vault) as $client){
-        $body.='<form method="post">'.csrf().'<input type="hidden" name="client" value="'.e($client['client_id']).'"><p>ChatGPT · '.(int)$client['active_tokens'].' jeton(s) actif(s)</p><button name="action" value="ai_revoke" class="secondary">Révoquer</button></form>';
+        $body.='<form method="post">'.csrf().'<input type="hidden" name="client" value="'.e($client['client_id']).'"><p>ChatGPT · '.(int)$client['active_tokens'].' jeton(s) actif(s)</p>'.field('owner_password','Votre mot de passe','','password').'<button name="action" value="ai_revoke" class="secondary">Révoquer</button></form>';
     }
     return $body;
 }
@@ -179,7 +190,7 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
     if(!is_array($p))return tipiRpcError($id,-32602,'Invalid params');
     if($method==='initialize'){
         $v=$p['protocolVersion']??'2025-11-25';
-        return tipiRpc($id,['protocolVersion'=>in_array($v,['2025-11-25','2025-06-18','2025-03-26'],true)?$v:'2025-11-25','capabilities'=>['tools'=>['listChanged'=>false]],'serverInfo'=>['name'=>'tipi-cms','version'=>TIPI_VERSION],'instructions'=>'Vous pilotez Tipi CMS. Appelez cms_site_info pour connaître les droits actuels. Présentez au membre les possibilités autorisées : créer des articles et pages, gérer le SEO, refaire le design public via cms_get_design/cms_update_design (CSS et dispositions), utiliser et créer des fonctions métier. Pour développer, inspectez app/McpActions et préparez puis validez un patch. Demandez au propriétaire de le valider dans /admin?connections=1 puis d’approuver la version du module. Ne déployez pas directement. Enregistrez les actions avec CGF ActionRegistry et TipiBusinessContext pour SQLite à la demande. Appelez cg_app_catalog puis cg_app_invoke pour les nouveaux outils. Pas de modification du noyau, des secrets ou de commande système. Les permissions réelles priment sur ces instructions.']);
+        return tipiRpc($id,['protocolVersion'=>in_array($v,['2025-11-25','2025-06-18','2025-03-26'],true)?$v:'2025-11-25','capabilities'=>['tools'=>['listChanged'=>false]],'serverInfo'=>['name'=>'tipi-cms','version'=>TIPI_VERSION],'instructions'=>'Vous pilotez Tipi CMS. Appelez cms_site_info pour connaître les droits actuels. Présentez au membre les possibilités autorisées : créer des articles et pages, gérer le SEO, refaire le design public via cms_get_design/cms_update_design (CSS et dispositions), utiliser et créer des fonctions métier. Pour développer, inspectez app/McpActions et préparez puis validez un patch. Demandez au propriétaire de vérifier puis installer et activer le patch dans /admin?connections=1. Seules les versions approuvées deviennent actives. Ne déployez pas directement. Enregistrez les actions avec CGF ActionRegistry et TipiBusinessContext pour SQLite à la demande. Appelez cg_app_catalog puis cg_app_invoke pour les nouveaux outils. Pas de modification du noyau, des secrets ou de commande système. Les permissions réelles priment sur ces instructions.']);
     }
     if($method==='ping')return tipiRpc($id,(object)[]);
     if(in_array($method,['resources/list','prompts/list'],true))return tipiRpc($id,[explode('/',$method)[0]=>[]]);
@@ -187,6 +198,8 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
     $canRead=tipiScope($principal,\CodeGraft\DynamicOAuth::APP_READ);
     $canWrite=tipiScope($principal,\CodeGraft\DynamicOAuth::APP_WRITE);
     $cgRead=tipiScope($principal,\CodeGraft\DynamicOAuth::READ);
+    $profile=$cfg['ai_profile']??'read';
+    if($profile==='read'){$cfg['mcp_write']=false;$cfg['mcp_publish']=false;$cfg['business_write']=false;}
     $cgWrite=tipiScope($principal,\CodeGraft\DynamicOAuth::WRITE);
     $devDefs=array_values(array_filter(\CodeGraft\Mcp::definitions(),static fn($t)=>in_array($t['name'],['cg_capabilities','cg_list_files','cg_search','cg_project_map','cg_read_files','cg_prepare_patch','cg_prepare_diff','cg_validate_patch','cg_history'],true)));
     if($method==='tools/list'){
