@@ -345,7 +345,7 @@ final class MiniMarkdown {
   }
 }
 
-const TIPI_VERSION = '0.8.0-preview';
+const TIPI_VERSION = '0.9.0-preview';
 const TIPI_SETUP_HASH = '';
 const MAX_CONTENT = 262144;
 
@@ -425,19 +425,128 @@ function encodeDoc(array $meta, string $body): string {
 function rawDoc(string $title, string $body, array $extra=[]): string {
     return encodeDoc(array_merge(['title'=>$title,'description'=>'','date'=>gmdate('Y-m-d')],$extra),$body);
 }
-function fileDoc(string $d,string $slug,string $state): string { return $d.'/'.$state.'/'.slugok($slug).'.md'; }
+// An atomic JSON record keeps metadata and canonical HTML in one revision.
+// Legacy Markdown files remain readable until explicitly migrated.
+function fileDoc(string $d,string $slug,string $state): string { return $d.'/'.$state.'/'.slugok($slug).'.json'; }
+function legacyDoc(string $d,string $slug,string $state): string {return $d.'/'.$state.'/'.slugok($slug).'.md';}
+function documentSlugs(string $d,string $state): array {
+    $out=[];
+    foreach(['','blog/'] as $sub){
+        $dir=$d.'/'.$state.'/'.$sub;
+        if(!is_dir($dir))continue;
+        if(!is_readable($dir))fail('Inventaire indisponible',503);
+        foreach(['md','json'] as $ext){
+            $files=glob($dir.'*.'.$ext);if($files===false)fail('Inventaire indisponible',503);
+            foreach($files as $f){if(is_link($f))fail('Document symbolique interdit',409);$out[slugok($sub.basename($f,'.'.$ext))]=true;}
+        }
+    }
+    $slugs=array_keys($out);sort($slugs);return $slugs;
+}
 function loadDoc(string $d,string $slug,string $state): ?string {
-    $f=fileDoc($d,$slug,$state); return is_file($f)?(string)file_get_contents($f):null;
+    $f=fileDoc($d,$slug,$state);
+    if(is_file($f)){
+        if(is_link($f))fail('Document symbolique interdit',409);
+        $record=jread($f);
+        if(($record['format']??'')!=='html'||!is_array($record['meta']??null)||!is_string($record['html']??null))fail('Document HTML invalide',500);
+        return encodeDoc($record['meta']+['format'=>'html'],$record['html']);
+    }
+    $f=legacyDoc($d,$slug,$state);
+    if(is_link($f))fail('Document symbolique interdit',409);
+    return is_file($f)?(string)file_get_contents($f):null;
 }
 function effective(string $d,string $slug): ?string { return loadDoc($d,$slug,'drafts') ?? loadDoc($d,$slug,'published'); }
 function sha(?string $raw): string { return $raw===null?'':hash('sha256',$raw); }
 function inventory(string $d,string $state='published'): array {
-    $out=[];
-    foreach (['','blog/'] as $sub) foreach (glob($d.'/'.$state.'/'.$sub.'*.md')?:[] as $f) {
-        $slug=$sub.basename($f,'.md');
-        try { slugok($slug); [$meta]=front((string)file_get_contents($f)); $out[$slug]=$meta; } catch(RuntimeException $ignored) {}
+    $out=[];foreach(documentSlugs($d,$state) as $slug){[$meta]=front(loadDoc($d,$slug,$state));$out[$slug]=$meta;}return $out;
+}
+function dynamicHtml(string $body): bool {
+    return str_contains($body,'{{')||str_contains($body,'<!--tipi:');
+}
+function markdownHtml(string $body): string {
+    // Keep only the existing explicit whole-line component syntax executable.
+    $out='';$buf=[];$fenced=false;
+    $flush=static function()use(&$out,&$buf){if($buf){$out.=MiniMarkdown::toHtml(implode("\n",$buf));$buf=[];}};
+    foreach(explode("\n",$body) as $line){
+        if(preg_match('~^\s*\x60{3}~',$line))$fenced=!$fenced;
+        if(!$fenced&&preg_match('~^\s*\{\{(list:blog|component:[A-Za-z0-9_-]+|include:partials/[a-z0-9-]+\.md)\}\}\s*$~D',$line,$m)){
+            $flush();$out.='<!--tipi:'.$m[1].'-->';
+        }else $buf[]=$line;
     }
-    ksort($out); return $out;
+    $flush();return $out;
+}
+/** Strict editorial fragment validation. Application code remains in extensions,
+ * not in user-supplied HTML. Reject unsafe markup, do not silently strip content. */
+function validateEditorialHtml(string $html,bool $allowDynamic=true): string {
+    if(strlen($html)>MAX_CONTENT||!preg_match('//u',$html)||!class_exists(DOMDocument::class))fail('HTML trop volumineux, invalide ou extension DOM indisponible',422);
+    if(preg_match('~<\s*/?\s*(?:html|head|body|script|style|base|meta|link|svg|math|object|embed|form|input|textarea|template|noscript|plaintext|xmp)\b|<\?|<!DOCTYPE~i',$html))fail('Code applicatif interdit dans le contenu',422);
+    $dom=new DOMDocument();$previous=libxml_use_internal_errors(true);
+    try{
+        if(!$dom->loadHTML('<?xml encoding="UTF-8"><html><body>'.$html.'</body></html>',LIBXML_NONET|LIBXML_NOERROR|LIBXML_NOWARNING))fail('HTML invalide',422);
+        $body=$dom->getElementsByTagName('body')->item(0);
+        $allowed=explode(' ','p h1 h2 h3 h4 h5 h6 a img strong b em i u s del small sub sup span div section article figure figcaption ul ol li dl dt dd blockquote pre code hr br table caption thead tbody tfoot tr th td iframe');
+        $walk=function(DOMNode $node)use(&$walk,$allowed,$allowDynamic){
+            if($node->nodeType===XML_COMMENT_NODE){
+                if(!$allowDynamic||!preg_match('~^tipi:(?:list:blog|component:[A-Za-z0-9_-]+|include:partials/[a-z0-9-]+\.md)$~D',$node->nodeValue))fail('Commentaire ou composant HTML non autorisé',422);
+                return;
+            }
+            if($node->nodeType===XML_TEXT_NODE)return;
+            if(!$node instanceof DOMElement||!in_array($tag=strtolower($node->tagName),$allowed,true))fail('Balise HTML non autorisée',422);
+            foreach($node->attributes as $attr){
+                $key=strtolower($attr->name);$value=$attr->value;
+                if(str_contains($value,'<!--tipi:')||str_contains($value,'{{'))fail('Composant interdit dans un attribut',422);
+                if(in_array($key,['href','src'],true)){
+                    if(($key==='href'&&$tag!=='a')||($key==='src'&&!in_array($tag,['img','iframe'],true)))fail('Attribut URL interdit',422);
+                    if($value===''||preg_match('~[\x00-\x20\x7f\\\\]~',$value)||str_starts_with($value,'//')||
+                        (!preg_match('~^https?://~i',$value)&&!str_starts_with($value,'/')&&!str_starts_with($value,'#')))fail('URL éditoriale non autorisée',422);
+                }elseif($key==='style'){
+                    if(!preg_match('~^\s*text-align\s*:\s*(?:left|right|center|justify)\s*;?\s*$~iD',$value))fail('Style éditorial non autorisé',422);
+                }elseif(!in_array($key,['class','id','title','alt','width','height','loading','decoding','rel','target','colspan','rowspan','scope','start','data-lang','frameborder','allow','allowfullscreen'],true)){
+                    fail('Attribut HTML non autorisé : '.$key,422);
+                }
+                if($key==='target'&&$value!=='_blank'&&$value!=='_self')fail('Cible HTML non autorisée',422);
+            }
+            if($tag==='iframe'&&!preg_match('~^https://www\.youtube-nocookie\.com/embed/[A-Za-z0-9_-]{6,}$~D',$node->getAttribute('src')))fail('Iframe non autorisée',422);
+            if($tag==='a'&&$node->getAttribute('target')==='_blank')$node->setAttribute('rel','noopener noreferrer');
+            foreach($node->childNodes as $child)$walk($child);
+        };
+        $out='';foreach($body->childNodes as $child){$walk($child);$out.=$dom->saveHTML($child);}
+        return $out;
+    }finally{libxml_clear_errors();libxml_use_internal_errors($previous);}
+}
+function canonicalDoc(array $meta,string $body): array {
+    $format=$meta['format']??'markdown';
+    if(!in_array($format,['markdown','html'],true))fail('Format éditorial inconnu',422);
+    $html=validateEditorialHtml($format==='html'?$body:markdownHtml($body));
+    $meta['format']='html';
+    if(strlen(encodeDoc($meta,$html))>MAX_CONTENT)fail('Document HTML trop volumineux',422);
+    return [$meta,$html];
+}
+function writeDoc(string $d,string $slug,string $state,string $raw): void {
+    [$meta,$body]=front($raw);[$meta,$html]=canonicalDoc($meta,$body);
+    jwrite(fileDoc($d,$slug,$state),['format'=>'html','meta'=>$meta,'html'=>$html]);
+    $legacy=legacyDoc($d,$slug,$state);if(is_file($legacy)&&!unlink($legacy))fail('Ancien document non retiré',500);
+}
+function removeDoc(string $d,string $slug,string $state): void {
+    // Remove legacy first: a crash cannot resurrect a stale Markdown file.
+    foreach([legacyDoc($d,$slug,$state),fileDoc($d,$slug,$state)] as $f)if(is_file($f)&&!unlink($f))fail('Suppression impossible',500);
+}
+function migrateEditorialHtml(string $d,bool $apply): array {
+    return locked($d,function()use($d,$apply){
+        $pending=[];
+        foreach(['published','drafts'] as $state)foreach(documentSlugs($d,$state) as $slug){
+            $legacy=legacyDoc($d,$slug,$state);if(!is_file($legacy))continue;
+            $old=(string)file_get_contents($legacy);
+            if(is_file(fileDoc($d,$slug,$state)))fail('Deux versions de stockage existent : '.$slug,409);
+            [$meta,$body]=front($old);[$meta,$html]=canonicalDoc($meta,$body);
+            $pending[]=[$state,$slug,$old,encodeDoc($meta,$html)];
+        }
+        if(!$apply||$pending===[])return ['mode'=>$apply?'applied':'dry_run','count'=>count($pending)];
+        $backup=$d.'/html-migration/'.gmdate('YmdHis').'-'.bin2hex(random_bytes(6));
+        foreach($pending as [$state,$slug,$old,$new])atomic($backup.'/'.$state.'/'.$slug.'.md',$old);
+        jwrite($backup.'/manifest.json',['count'=>count($pending),'created_at'=>gmdate(DATE_ATOM)]);
+        foreach($pending as [$state,$slug,$old,$new])writeDoc($d,$slug,$state,$new);
+        return ['mode'=>'applied','count'=>count($pending),'backup'=>$backup];
+    });
 }
 function snapshot(string $d,string $slug): string {
     $id=gmdate('YmdHis').'-'.bin2hex(random_bytes(6));
@@ -462,10 +571,12 @@ function saveDocLocked(string $d,string $slug,array $meta,string $body,string $e
             $live=loadDoc($d,$slug,'published');
             $meta['published_at']=$live!==null?(front($live)[0]['published_at']??gmdate(DATE_ATOM)):gmdate(DATE_ATOM);
         }
+        [$meta,$body]=canonicalDoc($meta,$body);
         $raw=encodeDoc($meta,$body);
         $rev=snapshot($d,$slug);
-        atomic(fileDoc($d,$slug,$publish?'published':'drafts'),$raw);
-        if ($publish && is_file(fileDoc($d,$slug,'drafts'))) unlink(fileDoc($d,$slug,'drafts'));
+        writeDoc($d,$slug,$publish?'published':'drafts',$raw);
+        if ($publish) removeDoc($d,$slug,'drafts');
+        $raw=loadDoc($d,$slug,$publish?'published':'drafts');
         return ['slug'=>$slug,'sha256'=>sha($raw),'revision'=>$rev,'status'=>$publish?'published':'draft','url'=>pageurl($slug)];
 }
 function documentState(string $d,string $slug): string {
@@ -489,9 +600,9 @@ function trashDocuments(string $d,array $items): array {
         foreach($selected as $slug=>$states)$record['documents'][$slug]=['revision'=>snapshot($d,$slug),'title'=>front($states['drafts']??$states['published'])[0]['title']];
         jwrite($d.'/trash/'.$id.'.json',$record);
         try{
-            foreach($selected as $slug=>$states)foreach($states as $state=>$raw)if($raw!==null&&!unlink(fileDoc($d,$slug,$state)))fail('Suppression impossible',500);
+            foreach($selected as $slug=>$states)foreach($states as $state=>$raw)if($raw!==null)removeDoc($d,$slug,$state);
         }catch(Throwable $ex){
-            foreach($selected as $slug=>$states)foreach($states as $state=>$raw)if($raw!==null)atomic(fileDoc($d,$slug,$state),$raw);
+            foreach($selected as $slug=>$states)foreach($states as $state=>$raw)if($raw!==null)writeDoc($d,$slug,$state,$raw);
             throw $ex;
         }
         return ['status'=>'trashed','batch'=>$id,'documents'=>$record['documents'],'count'=>count($selected),'restorable'=>true];
@@ -519,7 +630,7 @@ function restoreDoc(string $d,string $slug,string $rev,string $expected): void {
         snapshot($d,$slug);
         foreach (['published'=>'published','drafts'=>'draft'] as $state=>$key) {
             $f=fileDoc($d,$slug,$state);
-            if (is_string($s[$key])) atomic($f,$s[$key]); elseif(is_file($f)) unlink($f);
+            if (is_string($s[$key])) writeDoc($d,$slug,$state,$s[$key]); else removeDoc($d,$slug,$state);
         }
     });
 }
@@ -640,17 +751,9 @@ function tipiHubPairing(string $d,array $cfg,string $action,?callable $request=n
 }
 // Complete, bounded inventory of published source documents; drafts are never transmitted.
 function tipiHectorDocuments(string $d): array {
-    $docs=[];$ids=[];$files=[];
+    $docs=[];$ids=[];
     if(!is_dir($d.'/published')||!is_readable($d.'/published'))fail('Stockage éditorial indisponible',503);
-    foreach(['','blog/'] as $sub){
-        $dir=$d.'/published/'.$sub;
-        if(!is_dir($dir)){if($sub==='blog/')continue;fail('Stockage éditorial indisponible',503);}
-        if(!is_readable($dir))fail('Stockage éditorial indisponible',503);
-        $list=glob($dir.'*.md');if($list===false)fail('Inventaire éditorial indisponible',503);
-        foreach($list as $file)$files[]=[$sub,$file];
-    }
-    foreach($files as [$sub,$file]){
-        $slug=slugok($sub.basename($file,'.md'));
+    foreach(documentSlugs($d,'published') as $slug){
         $raw=loadDoc($d,$slug,'published');
         if($raw===null||strlen($raw)>MAX_CONTENT)fail('Inventaire éditorial incomplet',409);
         [$meta,$body]=front($raw);$uid=$meta['id']??'';
@@ -659,8 +762,8 @@ function tipiHectorDocuments(string $d): array {
         $docs[]=['source_uid'=>$uid,'slug'=>$slug,'title'=>$meta['title'],'seo_title'=>$meta['seo_title']??'',
             'meta_description'=>$meta['description']??'','modified'=>$meta['modified']??$meta['published_at']??'',
             'author_name'=>$meta['author']??'','category_name'=>$meta['category']??'','revision'=>sha($raw),
-            'content_markdown'=>$body,'content_html'=>MiniMarkdown::toHtml($body),
-            'has_draft'=>loadDoc($d,$slug,'drafts')!==null,'dynamic'=>str_contains($body,'{{')];
+            'content_markdown'=>($meta['format']??'markdown')==='html'?'':$body,'content_html'=>($meta['format']??'markdown')==='html'?$body:markdownHtml($body),'content_format'=>($meta['format']??'markdown'),
+            'has_draft'=>loadDoc($d,$slug,'drafts')!==null,'dynamic'=>dynamicHtml($body)];
         if(count($docs)>200)fail('Inventaire supérieur à 200 documents : synchronisation par lots nécessaire',413);
     }
     usort($docs,static fn($a,$b)=>strcmp($a['slug'],$b['slug']));
@@ -714,13 +817,17 @@ function tipiHectorApply(string $d,array $command,string $token): array {
         }
         if($draft!==null||!hash_equals(sha($live),$expected))fail('Un brouillon ou une version plus récente existe',409);
         [$meta,$body]=$live!==null?front($live):[['title'=>'','description'=>'','date'=>gmdate('Y-m-d')],''];
-        if(str_contains($body,'{{'))fail('Document dynamique protégé',409);
+        if(dynamicHtml($body))fail('Document dynamique protégé',409);
+        if(isset($fields['content_html'],$fields['content_markdown']))fail('Un seul format de contenu accepté',422);
         $map=['title'=>'title','seo_title'=>'seo_title','meta_description'=>'description','author_name'=>'author','category_name'=>'category'];
         foreach($fields as $key=>$value){
             if(!is_string($value)||!preg_match('//u',$value))fail('Champ éditorial invalide',422);
-            if($key==='content_markdown'){
+            if($key==='content_html'){
+                if(dynamicHtml($value))fail('Composant dynamique interdit',422);
+                $body=validateEditorialHtml($value,false);$meta['format']='html';
+            }elseif($key==='content_markdown'){
                 if(strlen($value)>MAX_CONTENT||str_contains($value,'{{'))fail('Markdown dynamique ou trop volumineux',422);
-                $body=$value;
+                $body=$value;$meta['format']='markdown';
             }elseif(isset($map[$key])){
                 if(strlen($value)>2000||preg_match('/[\r\n\x00]/',$value))fail('Métadonnée invalide',422);
                 $meta[$map[$key]]=$value;
@@ -1000,8 +1107,10 @@ function publicPage(string $d,array $cfg,string $slug,bool $preview=false): void
     $schema=['@context'=>'https://schema.org','@type'=>str_starts_with($slug,'blog/')?'Article':'WebPage','name'=>$m['title'],'url'=>$url,'description'=>$desc];
     if(str_starts_with($slug,'blog/')) { $schema['headline']=$m['title']; if(!empty($m['published_at']))$schema['datePublished']=$m['published_at']; if(!empty($m['modified']))$schema['dateModified']=$m['modified']; if(!empty($m['author']))$schema['author']=['@type'=>'Person','name'=>$m['author']]; }
     $head.='<script type="application/ld+json">'.json_encode($schema,JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR).'</script>';
-    $html=renderBody($d,$body,$preview?[]:$cfg);
-    if (!preg_match('~<h1>~i',$html)) $html='<h1>'.e($m['title']).'</h1>'.$html;
+    $html=($m['format']??'markdown')==='html'
+        ?preg_replace_callback('~<!--tipi:(list:blog|component:[A-Za-z0-9_-]+|include:partials/[a-z0-9-]+\.md)-->~',fn($match)=>renderBody($d,'{{'.$match[1].'}}',$preview?[]:$cfg),$body)
+        :renderBody($d,$body,$preview?[]:$cfg);
+    if (!preg_match('~<h1(?:\s|>)~i',$html)) $html='<h1>'.e($m['title']).'</h1>'.$html;
     if($preview) $html='<p class="panel">Prévisualisation privée</p>'.$html;
     shell($title,$html,$head,navFor($d),$cfg['name'],$preview?[]:$cfg,$m['template']??'');
 }
@@ -1023,7 +1132,7 @@ function setup(string $d): void {
             if(is_file($d.'/config.json'))fail('Déjà installé',409);
             atomic($d.'/.htaccess',"Require all denied\n");
             $seed=['home'=>rawDoc($name,"# ".$name."\n\nBienvenue sur votre nouveau site. Modifiez cette page dans l’administration.\n\n## Derniers articles\n\n{{list:blog}}\n"),'blog'=>rawDoc('Blog',"# Blog\n\n{{list:blog}}\n",['nav'=>'10']),'blog/bienvenue'=>rawDoc('Bienvenue',"# Bienvenue\n\nVotre premier article est prêt. Vous pouvez le modifier depuis le panneau d’administration.\n",['description'=>'Découvrez votre nouveau site.','author'=>'Équipe éditoriale'])];
-            foreach($seed as $slug=>$raw){[$m,$b]=front($raw);$m['id']=bin2hex(random_bytes(12));$m['published_at']=gmdate(DATE_ATOM);atomic(fileDoc($d,$slug,'published'),encodeDoc($m,$b));}
+            foreach($seed as $slug=>$raw){[$m,$b]=front($raw);$m['id']=bin2hex(random_bytes(12));$m['published_at']=gmdate(DATE_ATOM);writeDoc($d,$slug,'published',encodeDoc($m,$b));}
             $source=(string)file_get_contents(__FILE__);
             $source=preg_replace("~const TIPI_SETUP_HASH = '[a-f0-9]*';~","const TIPI_SETUP_HASH = '';",$source,1);
             $createdIndex=false; $createdHtaccess=false;
@@ -1046,7 +1155,7 @@ function setup(string $d): void {
         redirect('/admin');
     }
     header('Cache-Control: no-store');
-    shell('Installer Tipi CMS','<div class="panel"><h1>Installer Tipi CMS</h1><p>Markdown, PHP, sans base de données.</p><form method="post">'.csrf().field('key','Clé d’installation','','password').field('name','Nom du site').field('url','URL du site','https://').field('password','Mot de passe administrateur (12 caractères minimum)','','password').'<button>Installer</button></form></div>');
+    shell('Installer Tipi CMS','<div class="panel"><h1>Installer Tipi CMS</h1><p>HTML natif, PHP, sans base de données.</p><form method="post">'.csrf().field('key','Clé d’installation','','password').field('name','Nom du site').field('url','URL du site','https://').field('password','Mot de passe administrateur (12 caractères minimum)','','password').'<button>Installer</button></form></div>');
 }
 function admin(string $d,array $cfg): void {
     sessionStart(); header('Cache-Control: no-store'); header('X-Robots-Tag: noindex, nofollow');
@@ -1156,7 +1265,7 @@ function admin(string $d,array $cfg): void {
     if(isset($_GET['edit'])||isset($_GET['new'])){
         $slug=isset($_GET['edit'])?slugok((string)$_GET['edit']):'';$raw=$slug!==''?effective($d,$slug):null;
         $rawForm=$raw??rawDoc('Nouvelle page',"\n# Nouvelle page\n\n");
-        $body='<h1>'.($slug===''?'Nouvelle page':e($slug)).'</h1><form method="post">'.csrf().'<input type="hidden" name="expected" value="'.sha($raw).'">'.field('slug','Identifiant (ex. services ou blog/article)',$slug).'<label>Markdown<textarea name="raw" required>'.e($rawForm).'</textarea></label><button name="action" value="draft" class="secondary">Enregistrer le brouillon</button><button name="action" value="publish">Publier</button></form>';
+        $body='<h1>'.($slug===''?'Nouvelle page':e($slug)).'</h1><form method="post">'.csrf().'<input type="hidden" name="expected" value="'.sha($raw).'">'.field('slug','Identifiant (ex. services ou blog/article)',$slug).'<label>Contenu (front matter + HTML ou Markdown)<textarea name="raw" required>'.e($rawForm).'</textarea></label><button name="action" value="draft" class="secondary">Enregistrer le brouillon</button><button name="action" value="publish">Publier</button></form>';
         if($slug!==''&&$raw!==null){
             $body.='<form method="post">'.csrf().'<input type="hidden" name="slug" value="'.e($slug).'"><input type="hidden" name="expected" value="'.documentState($d,$slug).'"><p>Déplacer cette page et ses brouillons vers la corbeille (restaurable).</p><button class="secondary" name="action" value="trash">Mettre à la corbeille</button></form>';
             $body.='<p><a href="/admin?preview='.rawurlencode($slug).'">Prévisualiser</a></p><h2>Historique</h2>';
@@ -1175,7 +1284,7 @@ function api(string $d,array $cfg,string $path): never {
     $auth=$_SERVER['HTTP_AUTHORIZATION']??$_SERVER['REDIRECT_HTTP_AUTHORIZATION']??'';
     if(empty($cfg['api_hash'])||!preg_match('~^Bearer ([a-f0-9]{64})$~D',$auth,$m)||!hash_equals($cfg['api_hash'],hash('sha256',$m[1])))jsonout(['error'=>'Non autorisé'],401);
     $method=$_SERVER['REQUEST_METHOD'];
-    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','codegraft_bridge'=>is_file(dirname(__DIR__).'/tipi-system/bridge.php'),'hub'=>!empty(tipiHubConfig($d)['access_token']),'hub_tracking'=>tipiHubStatus($d)]);
+    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'html','accepted_formats'=>['html','markdown'],'publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','codegraft_bridge'=>is_file(dirname(__DIR__).'/tipi-system/bridge.php'),'hub'=>!empty(tipiHubConfig($d)['access_token']),'hub_tracking'=>tipiHubStatus($d)]);
     if($method==='GET'&&$path==='/api/v1/pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
         foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug)),'state_sha256'=>documentState($d,$slug)];
@@ -1199,7 +1308,7 @@ function mcpTools(): array {
     $input=static fn(array $p,array $r)=>['type'=>'object','properties'=>$p,'required'=>$r,'additionalProperties'=>false];
     $slug=['type'=>'string','description'=>'Identifiant : home, services ou blog/article'];
     $hash=['type'=>'string','description'=>'Empreinte SHA-256 actuelle ; chaîne vide pour un nouveau document'];
-    $raw=['type'=>'string','description'=>'Document Markdown complet, front matter inclus'];
+    $raw=['type'=>'string','description'=>'Document complet avec front matter. format: html pour le corps HTML ; sans format, Markdown accepté.'];
     $tool=static fn($n,$d,$schema,$ro)=>['name'=>$n,'description'=>$d,'inputSchema'=>$schema,'annotations'=>['readOnlyHint'=>$ro,'destructiveHint'=>!$ro,'openWorldHint'=>false]];
     return [
         $tool('cms_site_info','Informations et capacités du site : contenu, design et extensions métier. À consulter avant de proposer une intervention.',$empty,true),
@@ -1213,7 +1322,7 @@ function mcpTools(): array {
         $tool('cms_delete_page','Met à la corbeille une page ou un article et ses brouillons. Demander accord explicite avant suppression. Utiliser state_sha256 de cms_list_pages.',$input(['slug'=>$slug,'state_sha256'=>$hash],['slug','state_sha256']),false),
         $tool('cms_delete_pages','Met à la corbeille jusqu’à 100 documents explicitement sélectionnés. Présenter la liste et obtenir accord avant appel. Les empreintes des deux états sont vérifiées.',$input(['pages'=>['type'=>'array','minItems'=>1,'maxItems'=>100,'items'=>$input(['slug'=>$slug,'state_sha256'=>$hash],['slug','state_sha256'])]],['pages']),false),
         $tool('cms_restore_page','Restaure une révision depuis la corbeille uniquement si le slug est toujours libre.',$input(['slug'=>$slug,'revision'=>['type'=>'string']],['slug','revision']),false),
-        $tool('cms_publish','Publie un document Markdown complet. Requiert publication.',$input(['slug'=>$slug,'raw'=>$raw,'expected_sha256'=>$hash],['slug','raw','expected_sha256']),false)
+        $tool('cms_publish','Publie un document HTML ou Markdown complet. Requiert publication.',$input(['slug'=>$slug,'raw'=>$raw,'expected_sha256'=>$hash],['slug','raw','expected_sha256']),false)
     ];
 }
 function mcpCall(string $d,array $cfg,string $name,array $args): array {
@@ -1224,7 +1333,7 @@ function mcpCall(string $d,array $cfg,string $name,array $args): array {
         if(!is_string($args['expected_sha256']??null))fail('expected_sha256 requis');
         $expected=$args['expected_sha256'];unset($args['expected_sha256']);return changeDesign($d,$args,$expected);
     }
-    if($name==='cms_site_info')return ['name'=>$cfg['name'],'url'=>$cfg['url'],'version'=>TIPI_VERSION,'storage'=>'markdown','tracking'=>tipiHubStatus($d),'draft_write'=>!empty($cfg['mcp_write']),'publish'=>!empty($cfg['mcp_publish']),'ai_profile'=>$cfg['ai_profile']??'read','design'=>['read'=>true,'write'=>!empty($cfg['mcp_write'])&&!empty($cfg['mcp_publish']),'layouts'=>['classic','wide','centered','editorial'],'custom_css'=>true],'business'=>['read'=>!empty($cfg['business_read']),'write'=>!empty($cfg['business_write']),'development'=>($cfg['ai_profile']??'read')==='build','guide'=>'Utiliser cms_developer_guide : créer des routes, vues, contrôleurs, services, actions MCP, layouts HTML, composants et assets CSS/JS, puis préparer et vérifier un patch avec cg_review_release. Respecter le mode de validation sélectionné.']];
+    if($name==='cms_site_info')return ['name'=>$cfg['name'],'url'=>$cfg['url'],'version'=>TIPI_VERSION,'storage'=>'html','accepted_formats'=>['html','markdown'],'tracking'=>tipiHubStatus($d),'draft_write'=>!empty($cfg['mcp_write']),'publish'=>!empty($cfg['mcp_publish']),'ai_profile'=>$cfg['ai_profile']??'read','design'=>['read'=>true,'write'=>!empty($cfg['mcp_write'])&&!empty($cfg['mcp_publish']),'layouts'=>['classic','wide','centered','editorial'],'custom_css'=>true],'business'=>['read'=>!empty($cfg['business_read']),'write'=>!empty($cfg['business_write']),'development'=>($cfg['ai_profile']??'read')==='build','guide'=>'Utiliser cms_developer_guide : créer des routes, vues, contrôleurs, services, actions MCP, layouts HTML, composants et assets CSS/JS, puis préparer et vérifier un patch avec cg_review_release. Respecter le mode de validation sélectionné.']];
     if($name==='cms_list_pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
         foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug)),'state_sha256'=>documentState($d,$slug)];
@@ -1327,6 +1436,10 @@ function main(): void {
 }
 if (PHP_SAPI === 'cli' && defined('TIPI_LIBRARY_ONLY') && TIPI_LIBRARY_ONLY===true) return;
 if (PHP_SAPI === 'cli') {
+    if(($argv[1]??'')==='--tipi-migrate-html'){
+        try{echo json_encode(migrateEditorialHtml(dataDir(),in_array('--apply',$argv,true)),JSON_THROW_ON_ERROR|JSON_UNESCAPED_SLASHES).PHP_EOL;exit;}
+        catch(Throwable $ex){fwrite(STDERR,"Migration HTML interrompue : ".$ex->getMessage().PHP_EOL);exit(1);}
+    }
     if(($argv[1]??'')==='--tipi-run-hector'){
         try{$d=dataDir();$cfg=jread($d.'/config.json');if(!$cfg)fail('CMS non installé',409);
             echo json_encode(tipiHectorRun($d,$cfg),JSON_THROW_ON_ERROR).PHP_EOL;exit;
