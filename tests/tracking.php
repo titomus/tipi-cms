@@ -107,6 +107,33 @@ try{
     expect(str_contains(front(loadDoc($d,'blog/one','drafts'))[1],'UNPUBLISHED SECRET'),'Draft migrated independently');
     expect(migrateEditorialHtml($d,true)['count']===0,'Migration idempotent');
     expect(str_contains(markdownHtml("# Home\n\n{{component:hero}}"),'<!--tipi:component:hero-->'),'Dynamic marker preserved');
+    // Direct API signatures are scoped to method, path, time and exact body.
+    $key=tipiEditorialKey($token);$stamp='1700000000';$path='/api/v1/hector/commands';$payload='{"example":true}';
+    $sig=tipiEditorialSignature($key,'POST',$path,$stamp,$payload);
+    expect(tipiEditorialAuthenticate(tipiHubConfig($d),'POST',$path,$stamp,$sig,$payload,1700000000)===$token,'Scoped HMAC accepted');
+    foreach([['GET',$path,$stamp,$payload,1700000000],['POST',$path.'/other',$stamp,$payload,1700000000],
+        ['POST',$path,$stamp,'{}',1700000000],['POST',$path,$stamp,$payload,1700000121]] as [$method,$route,$time,$body,$now]){
+        try{tipiEditorialAuthenticate(tipiHubConfig($d),$method,$route,$time,$sig,$body,$now);throw new LogicException('Expected signature refusal');}
+        catch(RuntimeException $ex){expect($ex->getCode()===401,'Altered or expired signature rejected');}
+    }
+    $page=['id'=>str_repeat('7',32),'slug'=>'services-direct','expected_revision'=>'','mode'=>'publish','fields'=>['title'=>'Services','content_html'=>'<p>HTML service</p>','category_name'=>'Direct']];
+    $category=tipiEditorialCategorySave($d,'direct',['name'=>'Direct','description'=>'Category catalog','expected_revision'=>''],$token);
+    expect($category['assigned_count']===0,'Empty categories can exist independently');
+    $direct=tipiHectorApply($d,$page,$token,true);
+    expect($direct['status']==='applied'&&tipiHectorDocument($d,'services-direct')['content_html']==='<p>HTML service</p>','Native page creation and direct read');
+    expect(tipiHectorApply($d,$page,$token,true)===$direct,'Direct retry has identical receipt');
+    $list=array_column(tipiEditorialCategories($d),null,'slug');
+    expect($list['direct']['assigned_count']===1,'Category assignment tracked');
+    $category=tipiEditorialCategorySave($d,'direct',['name'=>'Direct','description'=>'Updated','expected_revision'=>$list['direct']['revision']],$token);
+    expect($category['description']==='Updated','Category update');
+    try{tipiEditorialCategorySave($d,'direct',['name'=>'Other','expected_revision'=>$category['revision']],$token);throw new LogicException('Expected assigned rename refusal');}
+    catch(RuntimeException $ex){expect($ex->getCode()===409,'Assigned category name protected');}
+    $draftCommand=['id'=>str_repeat('6',32),'slug'=>'blog/direct-draft','expected_revision'=>'','mode'=>'draft','fields'=>['title'=>'Draft','content_html'=>'<p>Draft content</p>']];
+    $draftResult=tipiHectorApply($d,$draftCommand,$token,true);
+    $draftCommand['id']=str_repeat('5',32);$draftCommand['expected_revision']=$draftResult['revision'];$draftCommand['fields']=['title'=>'New draft title'];
+    $draftResult=tipiHectorApply($d,$draftCommand,$token,true);
+    $draftCommand['id']=str_repeat('4',32);$draftCommand['expected_revision']=$draftResult['revision'];$draftCommand['mode']='publish';
+    expect(tipiHectorApply($d,$draftCommand,$token,true)['mode']==='publish'&&loadDoc($d,'blog/direct-draft','drafts')===null,'Owned draft can be updated and published');
     // Exercise polling, full inventory refresh and acknowledgement recovery.
     $queued=array_replace($new,['id'=>str_repeat('9',32),'slug'=>'blog/poll']);
     $ackAttempts=0;$polls=0;
