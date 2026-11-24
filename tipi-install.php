@@ -345,7 +345,7 @@ final class MiniMarkdown {
   }
 }
 
-const TIPI_VERSION = '0.2.0-preview';
+const TIPI_VERSION = '0.3.0-preview';
 const TIPI_SETUP_HASH = '';
 const MAX_CONTENT = 262144;
 
@@ -397,7 +397,7 @@ function locked(string $dir, callable $fn): mixed {
 }
 function slugok(string $slug): string {
     if (!preg_match('~^(?:blog/)?[a-z0-9][a-z0-9-]{0,99}$~D', $slug)) fail('Identifiant de page invalide');
-    if (in_array($slug, ['admin','api','assets','robots','sitemap','404','mcp'], true)) fail('Identifiant réservé');
+    if (in_array($slug, ['admin','api','assets','robots','sitemap','404','mcp','codegraft','codegraft-api'], true)) fail('Identifiant réservé');
     return $slug;
 }
 function pageurl(string $slug): string { return $slug === 'home' ? '/' : '/'.$slug; }
@@ -610,6 +610,10 @@ function admin(string $d,array $cfg): void {
             locked($d,function()use($d,$name,$theme,$accent){$c=jread($d.'/config.json');$c['name']=$name;$c['theme']=$theme;$c['accent']=$accent;jwrite($d.'/config.json',$c);});
             redirect('/admin?settings=1');
         }
+        if($act==='business_policy'){
+            locked($d,function()use($d){$c=jread($d.'/config.json');$c['business_read']=isset($_POST['business_read']);$c['business_write']=$c['business_read']&&isset($_POST['business_write']);jwrite($d.'/config.json',$c);});
+            redirect('/admin?connections=1');
+        }
         if($act==='mcp_rotate'){
             $token=bin2hex(random_bytes(32));
             locked($d,function()use($d,$token){$c=jread($d.'/config.json');$c['mcp_hash']=hash('sha256',$token);$c['mcp_write']=false;$c['mcp_publish']=false;jwrite($d.'/config.json',$c);});
@@ -644,7 +648,9 @@ function admin(string $d,array $cfg): void {
         shell('Apparence',$body,'',$nav);return;
     }
     if(isset($_GET['connections'])){
-        $body='<h1>Connexions</h1><h2>MCP éditorial natif</h2><p>Endpoint : <code>'.e($cfg['url'].'/mcp').'</code></p><p>Authentification Bearer, clé indépendante de l’API. '.(empty($cfg['mcp_hash'])?'Inactif':'Actif').'. Aucun accès au PHP ni au stockage privé.</p><form method="post">'.csrf().'<button name="action" value="mcp_rotate">Générer / renouveler la clé MCP</button><button class="secondary" name="action" value="mcp_revoke">Révoquer</button></form><form method="post">'.csrf().'<label><input style="display:inline;width:auto" type="checkbox" name="mcp_write" '.(!empty($cfg['mcp_write'])?'checked':'').'> Autoriser les brouillons</label><label><input style="display:inline;width:auto" type="checkbox" name="mcp_publish" '.(!empty($cfg['mcp_publish'])?'checked':'').'> Autoriser la publication (nécessite aussi les brouillons)</label><button name="action" value="mcp_policy">Enregistrer les droits</button></form><p class="muted">MCP 2025-11-25 / 2025-06-18 ; OAuth ChatGPT et moteur CodeGraft de développement non intégrés.</p><h2>API éditoriale</h2><p>Endpoint : <code>'.e($cfg['url'].'/api/v1').'</code>. La clé API se gère dans Contenus.</p><h2>Le Tipi</h2><p>Association au Hub non disponible dans cette version.</p>';
+        $bridge=is_file(dirname(__DIR__).'/tipi-system/bridge.php');
+        $business='<h2>CodeGraft et applications métier</h2>'.($bridge?'<p>Passerelle OAuth installée : <code>'.e($cfg['url'].'/codegraft-api/').'</code></p><p><a href="/codegraft/standalone/admin.php">Ouvrir les permissions CodeGraft</a></p><form method="post">'.csrf().'<label><input type="checkbox" style="width:auto;display:inline" name="business_read" '.(!empty($cfg['business_read'])?'checked':'').'> Activer les actions métier déclarées (lecture)</label><label><input type="checkbox" style="width:auto;display:inline" name="business_write" '.(!empty($cfg['business_write'])?'checked':'').'> Autoriser les écritures métier</label><button name="action" value="business_policy">Enregistrer</button></form><p>Le code PHP approuvé est exécuté avec les droits du compte hébergeur : ce n’est pas une sandbox.</p>':'<p>Option non installée. Voir scripts/install-codegraft.sh.</p>');
+        $body='<h1>Connexions</h1>'.$business.'<h2>MCP éditorial natif</h2><p>Endpoint : <code>'.e($cfg['url'].'/mcp').'</code></p><p>Authentification Bearer, clé indépendante de l’API. '.(empty($cfg['mcp_hash'])?'Inactif':'Actif').'. Aucun accès au PHP ni au stockage privé.</p><form method="post">'.csrf().'<button name="action" value="mcp_rotate">Générer / renouveler la clé MCP</button><button class="secondary" name="action" value="mcp_revoke">Révoquer</button></form><form method="post">'.csrf().'<label><input style="display:inline;width:auto" type="checkbox" name="mcp_write" '.(!empty($cfg['mcp_write'])?'checked':'').'> Autoriser les brouillons</label><label><input style="display:inline;width:auto" type="checkbox" name="mcp_publish" '.(!empty($cfg['mcp_publish'])?'checked':'').'> Autoriser la publication (nécessite aussi les brouillons)</label><button name="action" value="mcp_policy">Enregistrer les droits</button></form><p class="muted">MCP 2025-11-25 / 2025-06-18 ; Cet endpoint Bearer reste indépendant de la passerelle OAuth CodeGraft.</p><h2>API éditoriale</h2><p>Endpoint : <code>'.e($cfg['url'].'/api/v1').'</code>. La clé API se gère dans Contenus.</p><h2>Le Tipi</h2><p>Association au Hub non disponible dans cette version.</p>';
         shell('Connexions',$body,'',$nav);return;
     }
     if(isset($_GET['preview'])){publicPage($d,$cfg,slugok((string)$_GET['preview']),true);return;}
@@ -669,7 +675,7 @@ function api(string $d,array $cfg,string $path): never {
     $auth=$_SERVER['HTTP_AUTHORIZATION']??$_SERVER['REDIRECT_HTTP_AUTHORIZATION']??'';
     if(empty($cfg['api_hash'])||!preg_match('~^Bearer ([a-f0-9]{64})$~D',$auth,$m)||!hash_equals($cfg['api_hash'],hash('sha256',$m[1])))jsonout(['error'=>'Non autorisé'],401);
     $method=$_SERVER['REQUEST_METHOD'];
-    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','hub'=>false]);
+    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','codegraft_bridge'=>is_file(dirname(__DIR__).'/tipi-system/bridge.php'),'hub'=>false]);
     if($method==='GET'&&$path==='/api/v1/pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
         foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug))];
@@ -763,6 +769,11 @@ function main(): void {
     if (!preg_match('~^/[a-zA-Z0-9_./%-]*$~D',$path) || str_contains($path,'//')) fail('URL invalide',400);
     $d=dataDir();$cfg=jread($d.'/config.json');
     if(!$cfg){setup($d);return;}
+    if(in_array($path,['/codegraft-api','/codegraft-api/','/codegraft/standalone/admin.php','/codegraft-api/oauth/register/','/codegraft-api/oauth/authorize/','/codegraft-api/oauth/token/','/.well-known/oauth-authorization-server','/.well-known/oauth-authorization-server/','/.well-known/oauth-protected-resource','/.well-known/oauth-protected-resource/','/.well-known/oauth-protected-resource/codegraft-api','/.well-known/oauth-protected-resource/codegraft-api/'],true)){
+        $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
+        if(!is_file($bridge)||is_link($bridge)){http_response_code(404);return;}
+        require_once $bridge; tipiCodeGraftRoute($path,$d,$cfg);return;
+    }
     if(str_starts_with($path,'/tipi-install')){http_response_code(404);return;}
     if($path==='/admin'||$path==='/admin/') {admin($d,$cfg);return;}
     if(str_starts_with($path,'/api/'))api($d,$cfg,$path);
@@ -773,7 +784,7 @@ function main(): void {
     if($path==='/home'){header('Location: /',true,301);return;}
     if($path!=='/'&&str_ends_with($path,'/')&&preg_match('~^/(?:blog/)?[a-z0-9][a-z0-9-]{0,99}/$~D',$path)){header('Location: '.rtrim($path,'/'),true,301);return;}
     $slug=$path==='/'?'home':ltrim($path,'/');
-    if(!preg_match('~^(?:blog/)?[a-z0-9][a-z0-9-]{0,99}$~D',$slug)||in_array($slug,['admin','api','assets','robots','sitemap','404','mcp'],true)){http_response_code(404);shell('Page introuvable','<h1>Page introuvable</h1>','<meta name="robots" content="noindex">');return;}
+    if(!preg_match('~^(?:blog/)?[a-z0-9][a-z0-9-]{0,99}$~D',$slug)||in_array($slug,['admin','api','assets','robots','sitemap','404','mcp','codegraft','codegraft-api'],true)){http_response_code(404);shell('Page introuvable','<h1>Page introuvable</h1>','<meta name="robots" content="noindex">');return;}
     publicPage($d,$cfg,$slug);
 }
 if (PHP_SAPI === 'cli') {
