@@ -345,7 +345,7 @@ final class MiniMarkdown {
   }
 }
 
-const TIPI_VERSION = '0.3.0-preview';
+const TIPI_VERSION = '0.4.0-preview';
 const TIPI_SETUP_HASH = '';
 const MAX_CONTENT = 262144;
 
@@ -490,9 +490,10 @@ function siteurl(string $s): string {
     return rtrim($s,'/');
 }
 function sessionStart(): void {
+    if(session_status()===PHP_SESSION_ACTIVE)return;
     ini_set('session.use_strict_mode','1');
     session_name('tipi_cms_'.substr(hash('sha256',__DIR__),0,12));
-    session_set_cookie_params(['path'=>'/','secure'=>!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off','httponly'=>true,'samesite'=>'Strict']);
+    session_set_cookie_params(['path'=>'/','secure'=>!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off','httponly'=>true,'samesite'=>'Lax']);
     session_start();
     if (empty($_SESSION['csrf'])) $_SESSION['csrf']=bin2hex(random_bytes(32));
 }
@@ -510,9 +511,33 @@ function design(array $cfg): array {
     $accent=$cfg['accent']??''; if(is_string($accent)&&preg_match('~^#[a-fA-F0-9]{6}$~D',$accent))$v[0]=$v[1]=$accent;
     return $v;
 }
+function siteDesign(array $cfg): array {
+    return ['name'=>$cfg['name']??'Tipi CMS','theme'=>$cfg['theme']??'forest','accent'=>$cfg['accent']??'','layout'=>$cfg['layout']??'classic','custom_css'=>$cfg['custom_css']??''];
+}
+function designHash(array $cfg): string {return hash('sha256',json_encode(siteDesign($cfg),JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR));}
+function changeDesign(string $d,array $values,string $expected): array {
+    if(array_diff(array_keys($values),array_keys(siteDesign([]))))fail('Propriété de design inconnue');
+    foreach($values as $v)if(!is_string($v)||!preg_match('//u',$v))fail('Valeur invalide');
+    if(isset($values['name'])&&(trim($values['name'])===''||strlen($values['name'])>120||preg_match('~[\r\n\x00]~',$values['name'])))fail('Nom invalide');
+    if(isset($values['theme'])&&!in_array($values['theme'],['forest','ink','sand'],true))fail('Palette inconnue');
+    if(isset($values['accent'])&&$values['accent']!==''&&!preg_match('~^#[a-fA-F0-9]{6}$~D',$values['accent']))fail('Couleur invalide');
+    if(isset($values['layout'])&&!in_array($values['layout'],['classic','wide','centered','editorial'],true))fail('Disposition inconnue');
+    if(isset($values['custom_css'])&&(strlen($values['custom_css'])>30000||preg_match('~[<>\\\\\x00]|@import|url\s*\(|expression\s*\(|/\*~i',$values['custom_css'])))fail('CSS invalide : HTML, imports, URL, commentaires et échappements interdits');
+    return locked($d,function()use($d,$values,$expected){
+        $c=jread($d.'/config.json');
+        if(!hash_equals(designHash($c),$expected))fail('Le design a changé : rechargez',409);
+        $rev=gmdate('YmdHis').'-'.bin2hex(random_bytes(6));
+        jwrite($d.'/design-history/'.$rev.'.json',siteDesign($c));
+        $c=array_replace($c,$values);jwrite($d.'/config.json',$c);
+        return ['design'=>siteDesign($c),'sha256'=>designHash($c),'revision'=>$rev];
+    });
+}
 function shell(string $title,string $body,string $head='',string $nav='',string $brand='Tipi CMS',array $designConfig=[]): void {
     header('Content-Type: text/html; charset=utf-8');
-    echo '<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'.e($title).'</title>'.$head.'<style>'.strtr(css(),array_combine(['#176044','#244d39','#f7f8f5','#182c23'],design($designConfig))).'</style></head><body><header><strong><a href="/">'.e($brand).'</a></strong><nav>'.$nav.'</nav></header><main>'.$body.'</main><footer>Propulsé par Tipi CMS</footer></body></html>';
+    $layout=match($designConfig['layout']??'classic'){'wide'=>'header,main,footer{max-width:1200px}','centered'=>'header{justify-content:center;text-align:center}main{max-width:760px}nav{width:100%}','editorial'=>'main{max-width:760px}h1,h2,h3{font-family:Georgia,serif}header{max-width:1100px}',default=>''};
+    $extra=$designConfig['custom_css']??'';
+    if(!is_string($extra)||preg_match('~[<>]~',$extra))$extra='';
+    echo '<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'.e($title).'</title>'.$head.'<style>'.strtr(css(),array_combine(['#176044','#244d39','#f7f8f5','#182c23'],design($designConfig))).$layout.$extra.'</style></head><body><header><strong><a href="/">'.e($brand).'</a></strong><nav>'.$nav.'</nav></header><main>'.$body.'</main><footer>Propulsé par Tipi CMS · Propulsé par Codegraft™</footer></body></html>';
 }
 function navFor(string $d): string {
     $links=[];
@@ -603,11 +628,21 @@ function admin(string $d,array $cfg): void {
     if($post) {
         verifyCsrf(); $act=(string)($_POST['action']??'');
         if($act==='logout'){$_SESSION=[];session_destroy();redirect('/admin');}
+        if(in_array($act,['ai_profile','ai_deploy','ai_rollback','ai_revoke','ai_approve_module'],true)){
+            $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
+            if(!is_file($bridge)||is_link($bridge))fail('Assistant IA non installé',409);
+            require_once $bridge;
+            tipiAdminAction($d,$cfg,$act,$_POST);redirect('/admin?connections=1');
+        }
+        if($act==='design_restore'){
+            $id=(string)($_POST['revision']??'');
+            if(!preg_match('~^\d{14}-[a-f0-9]{12}$~D',$id))fail('Version invalide');
+            $old=jread($d.'/design-history/'.$id.'.json');if(!$old)fail('Version introuvable',404);
+            changeDesign($d,$old,(string)($_POST['expected']??''));redirect('/admin?settings=1');
+        }
         if($act==='settings'){
-            $name=trim((string)($_POST['name']??''));$theme=(string)($_POST['theme']??'forest');$accent=trim((string)($_POST['accent']??''));
-            if($name===''||strlen($name)>120||!preg_match('//u',$name)||preg_match('~[\r\n\x00]~',$name))fail('Nom invalide');
-            if(!in_array($theme,['forest','ink','sand'],true)||($accent!==''&&!preg_match('~^#[a-fA-F0-9]{6}$~D',$accent)))fail('Thème ou couleur invalide');
-            locked($d,function()use($d,$name,$theme,$accent){$c=jread($d.'/config.json');$c['name']=$name;$c['theme']=$theme;$c['accent']=$accent;jwrite($d.'/config.json',$c);});
+            $values=['name'=>trim((string)($_POST['name']??'')),'theme'=>(string)($_POST['theme']??'forest'),'accent'=>trim((string)($_POST['accent']??'')),'layout'=>(string)($_POST['layout']??'classic'),'custom_css'=>(string)($_POST['custom_css']??'')];
+            changeDesign($d,$values,(string)($_POST['expected']??''));
             redirect('/admin?settings=1');
         }
         if($act==='business_policy'){
@@ -652,29 +687,23 @@ function admin(string $d,array $cfg): void {
         else fail('Action inconnue');
         redirect('/admin?edit='.rawurlencode($slug));
     }
-    $nav='<a href="/admin">Contenus</a><a href="/admin?settings=1">Apparence</a><a href="/admin?connections=1">Connexions</a><a href="/">Voir le site</a>';
+    $nav='<a href="/admin">Contenus</a><a href="/admin?settings=1">Apparence</a><a href="/admin?connections=1">Assistant IA</a><a href="/">Voir le site</a><form method="post" action="/admin" style="display:inline">'.csrf().'<button class="secondary" name="action" value="logout">Déconnexion</button></form>';
     if(isset($_GET['settings'])){
         $choices='';foreach(['forest'=>'Forêt','ink'=>'Encre','sand'=>'Sable'] as $k=>$label)$choices.='<option value="'.$k.'" '.(($cfg['theme']??'forest')===$k?'selected':'').'>'.$label.'</option>';
-        $body='<h1>Apparence du site</h1><form method="post">'.csrf().field('name','Nom du site',$cfg['name']).'<label>Thème<select name="theme">'.$choices.'</select></label><label>Couleur personnalisée (facultatif, #RRGGBB)<input name="accent" value="'.e($cfg['accent']??'').'"></label><button name="action" value="settings">Enregistrer</button></form>';
+        $layouts='';foreach(['classic'=>'Classique','wide'=>'Large','centered'=>'Centré','editorial'=>'Éditorial'] as $k=>$label)$layouts.='<option value="'.$k.'" '.(($cfg['layout']??'classic')===$k?'selected':'').'>'.$label.'</option>';
+        $body='<h1>Apparence du site</h1><form method="post">'.csrf().'<input type="hidden" name="expected" value="'.designHash($cfg).'">'.field('name','Nom du site',$cfg['name']).'<label>Palette<select name="theme">'.$choices.'</select></label><label>Disposition<select name="layout">'.$layouts.'</select></label><label>Couleur personnalisée<input name="accent" value="'.e($cfg['accent']??'').'"></label><label>CSS personnalisé<textarea name="custom_css">'.e($cfg['custom_css']??'').'</textarea></label><button name="action" value="settings">Enregistrer</button></form><h2>Historique du design</h2>';
+        $history=glob($d.'/design-history/*.json')?:[];rsort($history);
+        foreach(array_slice($history,0,10) as $f){$id=basename($f,'.json');$body.='<form method="post">'.csrf().'<input type="hidden" name="expected" value="'.designHash($cfg).'"><input type="hidden" name="revision" value="'.e($id).'"><button class="secondary" name="action" value="design_restore">Restaurer '.e($id).'</button></form>';}
         shell('Apparence',$body,'',$nav);return;
     }
     if(isset($_GET['connections'])){
         $system=dirname(__DIR__).'/tipi-system';
-        $bridge=is_file($system.'/bridge.php')&&is_file($system.'/codegraft/standalone/config.php');
-        $moduleView='';
-        if($bridge){
-            require_once $system.'/bridge.php';
-            try{
-                $manifest=tipiBusinessManifest(dirname(__DIR__));
-                $fingerprint=hash('sha256',json_encode($manifest,JSON_THROW_ON_ERROR));
-                $moduleView='<input type="hidden" name="business_fingerprint" value="'.e($fingerprint).'"><h3>Versions des modules</h3><table><tr><th>Module</th><th>Empreinte SHA-256</th><th>État</th></tr>';
-                foreach($manifest as $file=>$hash)$moduleView.='<tr><td>'.e($file).'</td><td><small style="overflow-wrap:anywhere">'.e($hash).'</small></td><td>'.(($cfg['business_approved'][$file]??null)===$hash?'Approuvé':'À vérifier').'</td></tr>';
-                $moduleView.='</table>';
-            }catch(Throwable $ex){$moduleView='<p>Impossible de vérifier les modules. Les actions non vérifiables sont bloquées.</p>';}
-        }
-        $business='<h2>CodeGraft et applications métier</h2>'.($bridge?'<p>Passerelle OAuth installée : <code>'.e($cfg['url'].'/codegraft-api/').'</code></p><p><a href="/codegraft/standalone/admin.php">Ouvrir les permissions CodeGraft</a></p><form method="post">'.csrf().$moduleView.'<label><input type="checkbox" style="width:auto;display:inline" name="business_read" '.(!empty($cfg['business_read'])?'checked':'').'> Activer les actions métier déclarées (lecture)</label><label><input type="checkbox" style="width:auto;display:inline" name="business_write" '.(!empty($cfg['business_write'])?'checked':'').'> Autoriser les écritures métier</label><label><input type="checkbox" style="width:auto;display:inline" name="business_approve"> Approuver les versions PHP actuellement présentes dans app/McpActions (uniquement après revue du patch)</label><label><input type="checkbox" style="width:auto;display:inline" name="business_clear"> Révoquer toutes les approbations</label><button name="action" value="business_policy">Enregistrer</button></form><p>Le code PHP approuvé est exécuté avec les droits du compte hébergeur : ce n’est pas une sandbox.</p>':'<p>Option non installée. Voir scripts/install-codegraft.sh.</p>');
-        $body='<h1>Connexions</h1>'.$business.'<h2>MCP éditorial natif</h2><p>Endpoint : <code>'.e($cfg['url'].'/mcp').'</code></p><p>Authentification Bearer, clé indépendante de l’API. '.(empty($cfg['mcp_hash'])?'Inactif':'Actif').'. Aucun accès au PHP ni au stockage privé.</p><form method="post">'.csrf().'<button name="action" value="mcp_rotate">Générer / renouveler la clé MCP</button><button class="secondary" name="action" value="mcp_revoke">Révoquer</button></form><form method="post">'.csrf().'<label><input style="display:inline;width:auto" type="checkbox" name="mcp_write" '.(!empty($cfg['mcp_write'])?'checked':'').'> Autoriser les brouillons</label><label><input style="display:inline;width:auto" type="checkbox" name="mcp_publish" '.(!empty($cfg['mcp_publish'])?'checked':'').'> Autoriser la publication (nécessite aussi les brouillons)</label><button name="action" value="mcp_policy">Enregistrer les droits</button></form><p class="muted">MCP 2025-11-25 / 2025-06-18 ; Cet endpoint Bearer reste indépendant de la passerelle OAuth CodeGraft.</p><h2>API éditoriale</h2><p>Endpoint : <code>'.e($cfg['url'].'/api/v1').'</code>. La clé API se gère dans Contenus.</p><h2>Le Tipi</h2><p>Association au Hub non disponible dans cette version.</p>';
-        shell('Connexions',$body,'',$nav);return;
+        $body='<h1>Assistant IA</h1>';
+        if(is_file($system.'/bridge.php')&&is_file($system.'/codegraft/standalone/config.php')){
+            require_once $system.'/bridge.php';$body.=tipiAdminPanel($d,$cfg);
+        }else $body.='<p>Assistant de développement non installé. Voir la procédure de la distribution.</p>';
+        $body.='<details><summary>Connexions techniques avancées</summary><h2>API éditoriale</h2><p>Endpoint : <code>'.e($cfg['url'].'/api/v1').'</code>. Les clés se gèrent dans Contenus.</p><p>Le Tipi : association au Hub à venir.</p></details>';
+        shell('Assistant IA',$body,'',$nav);return;
     }
     if(isset($_GET['preview'])){publicPage($d,$cfg,slugok((string)$_GET['preview']),true);return;}
     if(isset($_GET['edit'])||isset($_GET['new'])){
@@ -725,7 +754,9 @@ function mcpTools(): array {
     $raw=['type'=>'string','description'=>'Document Markdown complet, front matter inclus'];
     $tool=static fn($n,$d,$schema,$ro)=>['name'=>$n,'description'=>$d,'inputSchema'=>$schema,'annotations'=>['readOnlyHint'=>$ro,'destructiveHint'=>!$ro,'openWorldHint'=>false]];
     return [
-        $tool('cms_site_info','Informations publiques et droits MCP du site',$empty,true),
+        $tool('cms_site_info','Informations et capacités du site : contenu, design et extensions métier. À consulter avant de proposer une intervention.',$empty,true),
+        $tool('cms_get_design','Lire palette, disposition, CSS personnalisé et empreinte',$empty,true),
+        $tool('cms_update_design','Modifier le design public (palette, disposition, CSS responsive) sans toucher au noyau. Utiliser le SHA de cms_get_design.',$input(['expected_sha256'=>$hash,'name'=>['type'=>'string'],'theme'=>['type'=>'string','enum'=>['forest','ink','sand']],'accent'=>['type'=>'string'],'layout'=>['type'=>'string','enum'=>['classic','wide','centered','editorial']],'custom_css'=>['type'=>'string']],['expected_sha256']),false),
         $tool('cms_list_pages','Liste les documents avec leur état et empreinte',$empty,true),
         $tool('cms_read_page','Lit le brouillon ou le document publié',$input(['slug'=>$slug],['slug']),true),
         $tool('cms_save_draft','Crée ou modifie un brouillon privé. Requiert écriture.',$input(['slug'=>$slug,'raw'=>$raw,'expected_sha256'=>$hash],['slug','raw','expected_sha256']),false),
@@ -733,7 +764,13 @@ function mcpTools(): array {
     ];
 }
 function mcpCall(string $d,array $cfg,string $name,array $args): array {
-    if($name==='cms_site_info')return ['name'=>$cfg['name'],'url'=>$cfg['url'],'version'=>TIPI_VERSION,'storage'=>'markdown','draft_write'=>!empty($cfg['mcp_write']),'publish'=>!empty($cfg['mcp_publish'])];
+    if($name==='cms_get_design')return ['design'=>siteDesign($cfg),'sha256'=>designHash($cfg)];
+    if($name==='cms_update_design'){
+        if(empty($cfg['mcp_write'])||empty($cfg['mcp_publish']))fail('Modification publique désactivée',403);
+        if(!is_string($args['expected_sha256']??null))fail('expected_sha256 requis');
+        $expected=$args['expected_sha256'];unset($args['expected_sha256']);return changeDesign($d,$args,$expected);
+    }
+    if($name==='cms_site_info')return ['name'=>$cfg['name'],'url'=>$cfg['url'],'version'=>TIPI_VERSION,'storage'=>'markdown','draft_write'=>!empty($cfg['mcp_write']),'publish'=>!empty($cfg['mcp_publish']),'ai_profile'=>$cfg['ai_profile']??'read','design'=>['read'=>true,'write'=>!empty($cfg['mcp_write'])&&!empty($cfg['mcp_publish']),'layouts'=>['classic','wide','centered','editorial'],'custom_css'=>true],'business'=>['read'=>!empty($cfg['business_read']),'write'=>!empty($cfg['business_write']),'development'=>($cfg['ai_profile']??'read')==='build','guide'=>'Créer des actions dans app/McpActions, préparer et valider le patch, demander l’approbation dans Assistant IA, puis utiliser cg_app_catalog et cg_app_invoke.']];
     if($name==='cms_list_pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
         foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug))];
