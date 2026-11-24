@@ -345,7 +345,7 @@ final class MiniMarkdown {
   }
 }
 
-const TIPI_VERSION = '0.6.0-preview';
+const TIPI_VERSION = '0.7.0-preview';
 const TIPI_SETUP_HASH = '';
 const MAX_CONTENT = 262144;
 
@@ -465,6 +465,46 @@ function saveDoc(string $d,string $slug,string $raw,string $expected,bool $publi
         if ($publish && is_file(fileDoc($d,$slug,'drafts'))) unlink(fileDoc($d,$slug,'drafts'));
         return ['slug'=>$slug,'sha256'=>sha($raw),'revision'=>$rev,'status'=>$publish?'published':'draft','url'=>pageurl($slug)];
     });
+}
+function documentState(string $d,string $slug): string {
+    return hash('sha256',json_encode([sha(loadDoc($d,$slug,'published')),sha(loadDoc($d,$slug,'drafts'))],JSON_THROW_ON_ERROR));
+}
+function trashDocuments(string $d,array $items): array {
+    if(!array_is_list($items)||count($items)<1||count($items)>100)fail('Sélectionner de 1 à 100 documents');
+    return locked($d,function()use($d,$items){
+        $selected=[];
+        foreach($items as $item){
+            if(!is_array($item)||!is_string($item['slug']??null)||!is_string($item['state_sha256']??null))fail('Slug et empreinte de chaque document requis');
+            $slug=slugok($item['slug']);
+            if(isset($selected[$slug]))fail('Document dupliqué');
+            $live=loadDoc($d,$slug,'published');$draft=loadDoc($d,$slug,'drafts');
+            if($live===null&&$draft===null)fail('Document introuvable : '.$slug,404);
+            if(!hash_equals(documentState($d,$slug),$item['state_sha256']))fail('Document modifié : '.$slug,409);
+            $selected[$slug]=['published'=>$live,'drafts'=>$draft];
+        }
+        $id=gmdate('YmdHis').'-'.bin2hex(random_bytes(6));
+        $record=['id'=>$id,'time'=>gmdate(DATE_ATOM),'documents'=>[]];
+        foreach($selected as $slug=>$states)$record['documents'][$slug]=['revision'=>snapshot($d,$slug),'title'=>front($states['drafts']??$states['published'])[0]['title']];
+        jwrite($d.'/trash/'.$id.'.json',$record);
+        try{
+            foreach($selected as $slug=>$states)foreach($states as $state=>$raw)if($raw!==null&&!unlink(fileDoc($d,$slug,$state)))fail('Suppression impossible',500);
+        }catch(Throwable $ex){
+            foreach($selected as $slug=>$states)foreach($states as $state=>$raw)if($raw!==null)atomic(fileDoc($d,$slug,$state),$raw);
+            throw $ex;
+        }
+        return ['status'=>'trashed','batch'=>$id,'documents'=>$record['documents'],'count'=>count($selected),'restorable'=>true];
+    });
+}
+function trashList(string $d): array {
+    $files=glob($d.'/trash/*.json')?:[];rsort($files);$out=[];
+    foreach(array_slice($files,0,100) as $f){
+        $batch=jread($f);
+        foreach($batch['documents']??[] as $slug=>$doc){
+            if(effective($d,$slug)!==null)continue;
+            $out[]=['slug'=>$slug,'title'=>$doc['title'],'revision'=>$doc['revision'],'batch'=>$batch['id'],'deleted_at'=>$batch['time']];
+        }
+    }
+    return $out;
 }
 function restoreDoc(string $d,string $slug,string $rev,string $expected): void {
     slugok($slug);
@@ -686,6 +726,9 @@ function admin(string $d,array $cfg): void {
             redirect('/admin');
         }
         $slug=slugok((string)($_POST['slug']??''));$expected=(string)($_POST['expected']??'');
+        if($act==='trash'){
+            trashDocuments($d,[['slug'=>$slug,'state_sha256'=>$expected]]);redirect('/admin?trash=1');
+        }
         if($act==='restore') restoreDoc($d,$slug,(string)($_POST['revision']??''),$expected);
         elseif(in_array($act,['draft','publish'],true))saveDoc($d,$slug,(string)($_POST['raw']??''),$expected,$act==='publish');
         else fail('Action inconnue');
@@ -710,12 +753,18 @@ function admin(string $d,array $cfg): void {
         $body.='<details><summary>Connexions techniques avancées</summary><h2>API éditoriale</h2><p>Endpoint : <code>'.e($cfg['url'].'/api/v1').'</code>. Les clés se gèrent dans Contenus.</p><p>Le Tipi : association au Hub à venir.</p></details>';
         shell('Assistant IA',$body,'',$nav);return;
     }
+    if(isset($_GET['trash'])){
+        $body='<h1>Corbeille</h1><p>Pages et articles supprimés, brouillons compris. <a href="/admin">Retour aux contenus</a></p>';
+        foreach(trashList($d) as $doc)$body.='<div class="panel"><strong>'.e($doc['title']).'</strong><p>'.e($doc['slug']).' · '.e($doc['deleted_at']).'</p><form method="post">'.csrf().'<input type="hidden" name="slug" value="'.e($doc['slug']).'"><input type="hidden" name="expected" value=""><input type="hidden" name="revision" value="'.e($doc['revision']).'"><button name="action" value="restore">Restaurer</button></form></div>';
+        shell('Corbeille',$body,'',$nav);return;
+    }
     if(isset($_GET['preview'])){publicPage($d,$cfg,slugok((string)$_GET['preview']),true);return;}
     if(isset($_GET['edit'])||isset($_GET['new'])){
         $slug=isset($_GET['edit'])?slugok((string)$_GET['edit']):'';$raw=$slug!==''?effective($d,$slug):null;
         $rawForm=$raw??rawDoc('Nouvelle page',"\n# Nouvelle page\n\n");
         $body='<h1>'.($slug===''?'Nouvelle page':e($slug)).'</h1><form method="post">'.csrf().'<input type="hidden" name="expected" value="'.sha($raw).'">'.field('slug','Identifiant (ex. services ou blog/article)',$slug).'<label>Markdown<textarea name="raw" required>'.e($rawForm).'</textarea></label><button name="action" value="draft" class="secondary">Enregistrer le brouillon</button><button name="action" value="publish">Publier</button></form>';
         if($slug!==''&&$raw!==null){
+            $body.='<form method="post">'.csrf().'<input type="hidden" name="slug" value="'.e($slug).'"><input type="hidden" name="expected" value="'.documentState($d,$slug).'"><p>Déplacer cette page et ses brouillons vers la corbeille (restaurable).</p><button class="secondary" name="action" value="trash">Mettre à la corbeille</button></form>';
             $body.='<p><a href="/admin?preview='.rawurlencode($slug).'">Prévisualiser</a></p><h2>Historique</h2>';
             $files=glob($d.'/history/'.$slug.'/*.json')?:[];rsort($files);
             foreach(array_slice($files,0,20) as $f){$rev=basename($f,'.json');$body.='<form method="post">'.csrf().'<input type="hidden" name="slug" value="'.e($slug).'"><input type="hidden" name="expected" value="'.sha($raw).'"><input type="hidden" name="revision" value="'.e($rev).'"><button class="secondary" name="action" value="restore">Restaurer '.e($rev).'</button></form>';}
@@ -723,7 +772,7 @@ function admin(string $d,array $cfg): void {
         shell('Édition',$body,'',$nav);return;
     }
     $live=inventory($d);$drafts=inventory($d,'drafts');$all=array_replace($live,$drafts);ksort($all);
-    $body='<h1>Vos contenus</h1><p><a class="btn" href="/admin?new=1">Nouvelle page ou article</a></p><table><tr><th>Page</th><th>État</th><th></th></tr>';
+    $body='<h1>Vos contenus</h1><p><a class="btn" href="/admin?new=1">Nouvelle page ou article</a> <a href="/admin?trash=1">Corbeille</a></p><table><tr><th>Page</th><th>État</th><th></th></tr>';
     foreach($all as $slug=>$m)$body.='<tr><td>'.e($m['title']).'<br><small>'.e(pageurl($slug)).'</small></td><td>'.(isset($drafts[$slug])?'Brouillon'.(isset($live[$slug])?' + publié':''):'Publié').'</td><td><a href="/admin?edit='.rawurlencode($slug).'">Modifier</a></td></tr>';
     $body.='</table><h2>API éditoriale</h2><p>Clé '.(empty($cfg['api_hash'])?'inactive':'active').'. Aucun accès au PHP.</p><form method="post">'.csrf().'<button name="action" value="rotate">Générer / renouveler la clé</button><button class="secondary" name="action" value="revoke">Révoquer</button></form><form method="post">'.csrf().'<label><input style="display:inline;width:auto" type="checkbox" name="allow_publish" '.(!empty($cfg['api_publish'])?'checked':'').'> Autoriser la publication via API</label><button name="action" value="api_policy">Enregistrer</button></form><form method="post">'.csrf().'<button class="secondary" name="action" value="logout">Déconnexion</button></form>';
     shell('Administration',$body,'',$nav);
@@ -735,12 +784,12 @@ function api(string $d,array $cfg,string $path): never {
     if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','codegraft_bridge'=>is_file(dirname(__DIR__).'/tipi-system/bridge.php'),'hub'=>false]);
     if($method==='GET'&&$path==='/api/v1/pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
-        foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug))];
+        foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug)),'state_sha256'=>documentState($d,$slug)];
         jsonout(['pages'=>$out]);
     }
     if(!preg_match('~^/api/v1/pages/(.+)$~D',$path,$m))jsonout(['error'=>'Route inconnue'],404);
     $slug=slugok($m[1]);
-    if($method==='GET'){$raw=effective($d,$slug);if($raw===null)jsonout(['error'=>'Introuvable'],404);jsonout(['slug'=>$slug,'raw'=>$raw,'sha256'=>sha($raw),'published'=>loadDoc($d,$slug,'published')!==null,'draft'=>loadDoc($d,$slug,'drafts')!==null]);}
+    if($method==='GET'){$raw=effective($d,$slug);if($raw===null)jsonout(['error'=>'Introuvable'],404);jsonout(['slug'=>$slug,'raw'=>$raw,'sha256'=>sha($raw),'state_sha256'=>documentState($d,$slug),'published'=>loadDoc($d,$slug,'published')!==null,'draft'=>loadDoc($d,$slug,'drafts')!==null]);}
     if($method==='PUT'){
         $body=file_get_contents('php://input',false,null,0,MAX_CONTENT+4096);
         $j=json_decode((string)$body,true,32,JSON_THROW_ON_ERROR);
@@ -765,6 +814,10 @@ function mcpTools(): array {
         $tool('cms_list_pages','Liste les documents avec leur état et empreinte',$empty,true),
         $tool('cms_read_page','Lit le brouillon ou le document publié',$input(['slug'=>$slug],['slug']),true),
         $tool('cms_save_draft','Crée ou modifie un brouillon privé. Requiert écriture.',$input(['slug'=>$slug,'raw'=>$raw,'expected_sha256'=>$hash],['slug','raw','expected_sha256']),false),
+        $tool('cms_list_trash','Liste les documents supprimés et leurs révisions restaurables',$empty,true),
+        $tool('cms_delete_page','Met à la corbeille une page ou un article et ses brouillons. Demander accord explicite avant suppression. Utiliser state_sha256 de cms_list_pages.',$input(['slug'=>$slug,'state_sha256'=>$hash],['slug','state_sha256']),false),
+        $tool('cms_delete_pages','Met à la corbeille jusqu’à 100 documents explicitement sélectionnés. Présenter la liste et obtenir accord avant appel. Les empreintes des deux états sont vérifiées.',$input(['pages'=>['type'=>'array','minItems'=>1,'maxItems'=>100,'items'=>$input(['slug'=>$slug,'state_sha256'=>$hash],['slug','state_sha256'])]],['pages']),false),
+        $tool('cms_restore_page','Restaure une révision depuis la corbeille uniquement si le slug est toujours libre.',$input(['slug'=>$slug,'revision'=>['type'=>'string']],['slug','revision']),false),
         $tool('cms_publish','Publie un document Markdown complet. Requiert publication.',$input(['slug'=>$slug,'raw'=>$raw,'expected_sha256'=>$hash],['slug','raw','expected_sha256']),false)
     ];
 }
@@ -778,15 +831,24 @@ function mcpCall(string $d,array $cfg,string $name,array $args): array {
     if($name==='cms_site_info')return ['name'=>$cfg['name'],'url'=>$cfg['url'],'version'=>TIPI_VERSION,'storage'=>'markdown','draft_write'=>!empty($cfg['mcp_write']),'publish'=>!empty($cfg['mcp_publish']),'ai_profile'=>$cfg['ai_profile']??'read','design'=>['read'=>true,'write'=>!empty($cfg['mcp_write'])&&!empty($cfg['mcp_publish']),'layouts'=>['classic','wide','centered','editorial'],'custom_css'=>true],'business'=>['read'=>!empty($cfg['business_read']),'write'=>!empty($cfg['business_write']),'development'=>($cfg['ai_profile']??'read')==='build','guide'=>'Utiliser cms_developer_guide : créer des routes, vues, contrôleurs, services, actions MCP, layouts HTML, composants et assets CSS/JS, puis préparer et vérifier un patch avec cg_review_release. Respecter le mode de validation sélectionné.']];
     if($name==='cms_list_pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
-        foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug))];
+        foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug)),'state_sha256'=>documentState($d,$slug)];
         return ['pages'=>$out];
+    }
+    if($name==='cms_list_trash')return ['documents'=>trashList($d)];
+    if(in_array($name,['cms_delete_page','cms_delete_pages','cms_restore_page'],true)){
+        if(empty($cfg['mcp_write'])||empty($cfg['mcp_publish']))fail('Permission de publication et suppression requise',403);
+        if($name==='cms_delete_page')return trashDocuments($d,[$args]);
+        if($name==='cms_delete_pages')return trashDocuments($d,$args['pages']??[]);
+        if(!is_string($args['slug']??null)||!is_string($args['revision']??null))fail('Slug et révision requis');
+        restoreDoc($d,$args['slug'],$args['revision'],'');
+        return ['status'=>'restored','slug'=>$args['slug'],'url'=>pageurl($args['slug'])];
     }
     if(!in_array($name,['cms_read_page','cms_save_draft','cms_publish'],true))fail('Outil inconnu',404);
     if(!isset($args['slug'])||!is_string($args['slug']))fail('slug requis');
     $slug=slugok($args['slug']);
     if($name==='cms_read_page'){
         $raw=effective($d,$slug);if($raw===null)fail('Introuvable',404);
-        return ['slug'=>$slug,'raw'=>$raw,'sha256'=>sha($raw),'published'=>loadDoc($d,$slug,'published')!==null,'draft'=>loadDoc($d,$slug,'drafts')!==null];
+        return ['slug'=>$slug,'raw'=>$raw,'sha256'=>sha($raw),'state_sha256'=>documentState($d,$slug),'published'=>loadDoc($d,$slug,'published')!==null,'draft'=>loadDoc($d,$slug,'drafts')!==null];
     }
     if(empty($cfg['mcp_write'])||($name==='cms_publish'&&empty($cfg['mcp_publish'])))fail('Permission MCP désactivée',403);
     if(!isset($args['raw'],$args['expected_sha256'])||!is_string($args['raw'])||!is_string($args['expected_sha256']))fail('raw et expected_sha256 requis');
