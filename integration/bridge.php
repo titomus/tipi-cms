@@ -46,8 +46,8 @@ function tipiRegistry(string $root,string $data,array $cfg): \CGF\ActionRegistry
     if(!is_array($approved))throw new RuntimeException('Approbations invalides');
     $context=new TipiBusinessContext($data.'/business');
     foreach(tipiBusinessManifest($root) as $file=>$hash){
-        if(!isset($approved[$file])||!is_string($approved[$file])||!hash_equals($approved[$file],$hash))continue;
-        $register=require $root.'/app/McpActions/'.$file;
+        $source=tipiApprovedFile($root,$cfg,'app/McpActions/'.$file);if(!$source)continue;
+        $register=require $source;
         if(!is_callable($register))throw new RuntimeException('Module non conforme');
         $register($registry,$context);
     }
@@ -66,10 +66,140 @@ function tipiBridgeDefinitions(): array {
         ['name'=>'cg_app_invoke','description'=>'Exécute une action métier déclarée (nom sans préfixe app_) avec les mêmes validations et autorisations.','inputSchema'=>['type'=>'object','properties'=>['action'=>['type'=>'string'],'arguments'=>['type'=>'object']],'required'=>['action','arguments'],'additionalProperties'=>false]]
     ];
 }
+function tipiDevDirs(): array {return ['app/McpActions','app/Controllers','app/Views','app/Services','app/Routes','app/Components','themes/layouts','themes/templates','themes/components','assets/css','assets/js'];}
+function tipiDevPath(string $path): bool {
+    if(!preg_match('~^[A-Za-z0-9/_-]+\.[a-z]+$~D',$path))return false;
+    $dir=dirname($path);$ext=pathinfo($path,PATHINFO_EXTENSION);
+    return in_array($dir,tipiDevDirs(),true)&&in_array($ext,match($dir){
+        'app/McpActions','app/Controllers','app/Views','app/Services','app/Components'=>['php'],
+        'app/Routes'=>['json'],'themes/layouts','themes/templates','themes/components'=>['html'],
+        'assets/css'=>['css'],'assets/js'=>['js'],default=>[]},true);
+}
+function tipiExtensionManifest(string $root): array {
+    $out=[];
+    foreach(tipiDevDirs() as $dir){
+        $base=$root;
+        foreach(explode('/',$dir) as $segment){$base.='/'.$segment;if(is_link($base))fail('Dossier extension symbolique interdit',400);}
+        foreach(glob($base.'/*')?:[] as $file){
+            $path=$dir.'/'.basename($file);
+            if(!tipiDevPath($path)||is_link($file)||!is_file($file)||filesize($file)>150000)continue;
+            $hash=hash_file('sha256',$file);if($hash!==false)$out[$path]=$hash;
+            if(count($out)>250)fail('Maximum 250 fichiers d’extension',400);
+        }
+    }
+    ksort($out);return $out;
+}
+function tipiApprovedFile(string $root,array $cfg,string $path): ?string {
+    if(!tipiDevPath($path))return null;
+    $full=$root;
+    foreach(explode('/',$path) as $part){$full.='/'.$part;if(is_link($full))return null;}
+    if(!is_file($full)||filesize($full)>150000)return null;
+    $approved=$cfg['extension_approved'][$path]??null;
+    if($approved===null&&dirname($path)==='app/McpActions')$approved=$cfg['business_approved'][basename($path)]??null;
+    $hash=hash_file('sha256',$full);
+    return is_string($approved)&&is_string($hash)&&hash_equals($approved,$hash)?$full:null;
+}
+function tipiRoutes(string $root,array $cfg): array {
+    $routes=[];
+    foreach(tipiExtensionManifest($root) as $file=>$hash){
+        if(dirname($file)!=='app/Routes'||!($full=tipiApprovedFile($root,$cfg,$file)))continue;
+        try{$r=json_decode((string)file_get_contents($full),true,16,JSON_THROW_ON_ERROR);}
+        catch(JsonException){continue;}
+        if(!is_array($r)||!is_string($r['path']??null)||!preg_match('~^/(?:admin/)?apps/[a-z0-9][a-z0-9-]{0,70}$~D',$r['path'])||!is_string($r['title']??null)||!is_string($r['handler']??null)||dirname($r['handler'])!=='app/Controllers'||!tipiApprovedFile($root,$cfg,$r['handler']))continue;
+        $private=str_starts_with($r['path'],'/admin/');
+        if(isset($routes[$r['path']])){ $routes[$r['path']]['conflict']=true;continue; }
+        $routes[$r['path']]=['path'=>$r['path'],'title'=>substr($r['title'],0,120),'handler'=>$r['handler'],'private'=>$private,'post'=>($r['post']??false)===true,'menu'=>($r['menu']??false)===true];
+    }
+    return array_filter($routes,fn($r)=>empty($r['conflict']));
+}
+function tipiAppNav(string $root,array $cfg,bool $private): string {
+    $out='';
+    foreach(tipiRoutes($root,$cfg) as $r)if($r['private']===$private&&$r['menu'])$out.='<a href="'.e($r['path']).'">'.e($r['title']).'</a>';
+    return $out;
+}
+final class TipiWebContext {
+    public function __construct(private readonly string $root,private readonly string $data,private readonly array $cfg,public readonly bool $owner,public readonly string $path,public readonly string $method){}
+    public function action(string $name,array $args=[]): array {
+        if(!$this->owner)fail('Action métier privée',403);
+        $cfg=$this->cfg;$cfg['business_read']=true; // Local owner is independent of remote AI profile.
+        $registry=tipiRegistry($this->root,$this->data,$cfg);
+        $a=$registry->all()[$name]??null;
+        if(!$a)fail('Action métier non approuvée',404);
+        if($a['mode']==='write'&&$this->method!=='POST')fail('Écriture uniquement via POST',405);
+        return $registry->run($name,$args,['role'=>'admin','id'=>1]);
+    }
+    public function database(string $name): \CGF\Database {
+        // Trusted PHP can use a private database; public handlers must validate their own business inputs.
+        require_once __DIR__.'/contracts/Data.php';
+        return (new TipiBusinessContext($this->data.'/business'))->database($name);
+    }
+    public function view(string $name,array $vars=[]): string {
+        $f=tipiApprovedFile($this->root,$this->cfg,'app/Views/'.$name.'.php');
+        if(!$f)fail('Vue non approuvée',404);
+        $render=static function(string $file,array $vars,TipiWebContext $ctx): string {
+            ob_start();try{require $file;return (string)ob_get_clean();}catch(Throwable $ex){ob_end_clean();throw $ex;}
+        };
+        return $render($f,$vars,$this);
+    }
+    public function service(string $name): mixed {
+        $f=tipiApprovedFile($this->root,$this->cfg,'app/Services/'.$name.'.php');
+        if(!$f)fail('Service non approuvé',404);
+        return require $f;
+    }
+    public function csrf(): string {return csrf();}
+}
+function tipiAppRoute(string $path,string $data,array $cfg): bool {
+    $root=dirname(__DIR__);$r=tipiRoutes($root,$cfg)[$path]??null;
+    if(!$r)return false;
+    $method=$_SERVER['REQUEST_METHOD']??'GET';
+    if(!in_array($method,$r['post']?['GET','POST']:['GET'],true)){http_response_code(405);return true;}
+    sessionStart();
+    if($r['private']&&empty($_SESSION['admin'])){redirect('/admin');}
+    if($method==='POST')verifyCsrf();
+    header('Cache-Control: no-store');header('X-Robots-Tag: noindex, nofollow');
+    $ctx=new TipiWebContext($root,$data,$cfg,$r['private']&&!empty($_SESSION['admin']),$path,$method);
+    $handler=require tipiApprovedFile($root,$cfg,$r['handler']);
+    if(!is_callable($handler))fail('Contrôleur non conforme',500);
+    $html=$handler($ctx,$_GET,$method==='POST'?$_POST:[]);
+    if(!is_string($html))fail('Vue non conforme',500);
+    $nav=$r['private']?'<a href="/admin">Contenus</a><a href="/admin?connections=1">Assistant IA</a>'.tipiAppNav($root,$cfg,true):navFor($data).tipiAppNav($root,$cfg,false);
+    shell($r['title'],$html,'<meta name="robots" content="noindex">',$nav,$r['private']?'Tipi CMS':$cfg['name'],$r['private']?[]:$cfg);
+    return true;
+}
+function tipiAsset(string $path,array $cfg): bool {
+    if(!preg_match('~^/assets/(css|js)/[A-Za-z0-9_-]+\.(css|js)$~D',$path,$m)||$m[1]!==$m[2])return false;
+    if(!in_array($_SERVER['REQUEST_METHOD']??'GET',['GET','HEAD'],true)){http_response_code(405);return true;}
+    $f=tipiApprovedFile(dirname(__DIR__),$cfg,ltrim($path,'/'));
+    if(!$f){http_response_code(404);return true;}
+    header('Content-Type: '.($m[2]==='js'?'text/javascript':'text/css').'; charset=utf-8');header('Cache-Control: no-cache');
+    if(($_SERVER['REQUEST_METHOD']??'GET')==='GET')readfile($f);
+    return true;
+}
+function tipiTheme(string $data,array $cfg,string $head,string $style,string $body,string $nav,string $brand,string $title,string $template=''): string {
+    $root=dirname(__DIR__);$assets='';
+    foreach(tipiExtensionManifest($root) as $path=>$hash){
+        if(!str_starts_with($path,'assets/')||!tipiApprovedFile($root,$cfg,$path))continue;
+        $url='/'.$path.'?v='.substr($hash,0,12);
+        $assets.=str_ends_with($path,'.css')?'<link rel="stylesheet" href="'.e($url).'">':'<script defer src="'.e($url).'"></script>';
+    }
+    if($template!==''&&preg_match('~^[A-Za-z0-9_-]+$~D',$template)&&($f=tipiApprovedFile($root,$cfg,'themes/templates/'.$template.'.html'))){
+        $html=(string)file_get_contents($f);if(str_contains($html,'{{content}}'))$body=strtr($html,['{{content}}'=>$body,'{{title}}'=>e($title)]);
+    }
+    $head='<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'.e($title).'</title>'.$head.'<style>'.$style.'</style>'.$assets;
+    $layout=tipiApprovedFile($root,$cfg,'themes/layouts/site.html');
+    $html=$layout?(string)file_get_contents($layout):'';
+    if(!str_contains($html,'{{head}}')||!str_contains($html,'{{content}}'))$html='<!doctype html><html lang="fr"><head>{{head}}</head><body><header><strong><a href="/">{{brand}}</a></strong><nav>{{navigation}}</nav></header><main>{{content}}</main><footer>{{credit}}</footer></body></html>';
+    $html=preg_replace_callback('~\{\{component:([A-Za-z0-9_-]+)\}\}~',function($m)use($root,$cfg){$f=tipiApprovedFile($root,$cfg,'themes/components/'.$m[1].'.html');return $f?(string)file_get_contents($f):'';},$html);
+    return strtr($html,['{{head}}'=>$head,'{{content}}'=>$body,'{{navigation}}'=>$nav.tipiAppNav($root,$cfg,false),'{{brand}}'=>e($brand),'{{title}}'=>e($title),'{{credit}}'=>'Propulsé par Codegraft™']);
+}
+function tipiMarkdownComponent(string $name,array $cfg): string {
+    $f=tipiApprovedFile(dirname(__DIR__),$cfg,'themes/components/'.$name.'.html');
+    return $f?(string)file_get_contents($f):'';
+}
 function tipiAiPolicy(string $profile): array {
     $p=\CodeGraft\Policy::defaults('generic');
-    $p['read_dirs']=['app/McpActions'];
-    $p['write_dirs']=$profile==='build'?['app/McpActions']:[];
+    $p['read_dirs']=tipiDevDirs();
+    $p['write_dirs']=$profile==='build'?tipiDevDirs():[];
     $p['enabled']=$profile==='build';
     // Upstream prepare() checks delete as well; our gateway never exposes deletion.
     if($p['enabled'])foreach(['list','search','read','prepare','delete','validate','deploy','rollback','history'] as $k)$p['permissions'][$k]=true;
@@ -114,9 +244,9 @@ function tipiAdminAction(string $data,array $cfg,string $action,array $post): vo
         locked($data,function()use($data,$file,$hash){
             $c=jread($data.'/config.json');
             if(($c['ai_profile']??'read')!=='build')fail('Profil modifié',409);
-            $m=tipiBusinessManifest(dirname(__DIR__));
+            $m=tipiExtensionManifest(dirname(__DIR__));
             if(!isset($m[$file])||!hash_equals($m[$file],$hash))fail('Version modifiée : rechargez la page',409);
-            $c['business_approved'][$file]=$hash;jwrite($data.'/config.json',$c);
+            $c['extension_approved'][$file]=$hash;jwrite($data.'/config.json',$c);
         });return;
     }
     $id=(string)($post['patch']??'');
@@ -125,26 +255,38 @@ function tipiAdminAction(string $data,array $cfg,string $action,array $post): vo
     if($action==='ai_deploy'){
         $draft=$vault->json('drafts/'.$id.'.json');
         if(!hash_equals(hash('sha256',json_encode($draft,JSON_THROW_ON_ERROR)),(string)($post['fingerprint']??'')))fail('Patch modifié : rechargez',409);
-        foreach($draft['files']??[] as $entry)if(!preg_match('~^app/McpActions/[A-Za-z][A-Za-z0-9_]*\.php$~D',$entry['path']??'')||($entry['operation']??'replace')!=='replace')fail('Seuls les modules métier PHP sont autorisés',403);
+        foreach($draft['files']??[] as $entry)if(!tipiDevPath((string)($entry['path']??''))||($entry['operation']??'replace')!=='replace')fail('Fichier hors espace de développement',403);
         $result=$cg['workspace']->validate($id);if(empty($result['valid']))fail('Le patch ne passe pas les contrôles');
         $cg['workspace']->deploy($id,true);
         // The owner explicitly approved the code shown in this exact patch.
         // Activate only these deployed versions, never unrelated pending modules.
         locked($data,function()use($data,$draft){
             $c=jread($data.'/config.json');if(($c['ai_profile']??'read')!=='build')return;
-            $current=tipiBusinessManifest(dirname(__DIR__));
+            $current=tipiExtensionManifest(dirname(__DIR__));
             foreach($draft['files'] as $entry){
-                $file=basename($entry['path']);$hash=$entry['after_sha256'];
-                if(isset($current[$file])&&hash_equals($current[$file],$hash))$c['business_approved'][$file]=$hash;
+                $file=$entry['path'];$hash=$entry['after_sha256'];
+                if(isset($current[$file])&&hash_equals($current[$file],$hash))$c['extension_approved'][$file]=$hash;
             }
             jwrite($data.'/config.json',$c);
         });
-    }elseif($action==='ai_rollback')$cg['workspace']->rollback($id,true);
+    }elseif($action==='ai_rollback'){
+        $release=$vault->json('releases/'.$id.'.json');
+        $cg['workspace']->rollback($id,true);
+        locked($data,function()use($data,$release){
+            $c=jread($data.'/config.json');$m=tipiExtensionManifest(dirname(__DIR__));
+            foreach($release['files']??[] as $entry){
+                $p=$entry['path'];unset($c['extension_approved'][$p]);
+                // A restored source must be reviewed again before execution.
+                if(dirname($p)==='app/McpActions')unset($c['business_approved'][basename($p)]);
+            }
+            jwrite($data.'/config.json',$c);
+        });
+    }
 }
 function tipiAdminPanel(string $data,array $cfg): string {
     $cg=tipiSystem();$vault=$cg['vault'];$profile=$cfg['ai_profile']??'read';
-    $body='<div class="panel"><h2>Connecter votre assistant</h2><p>Une adresse pour gérer vos articles, votre design et vos outils métier.</p><p><code>'.e($cfg['url'].'/codegraft-api/').'</code></p><p>Dans ChatGPT, ajoutez un serveur MCP personnalisé avec OAuth. Connectez-vous avec votre mot de passe habituel du site.</p></div><h2>Que peut faire votre IA ?</h2><form method="post">'.csrf();
-    foreach(['read'=>['Consultation','Lire les contenus, le design et les données des modules approuvés.'],'manage'=>['Gestion du site','Créer et publier des articles, refaire la présentation et utiliser vos outils métier.'],'build'=>['Création de fonctionnalités','Toutes les capacités précédentes, plus la création de nouveaux outils PHP et SQLite. Chaque déploiement nécessite votre accord.']] as $k=>$v){
+    $body='<div class="panel"><h2>Connecter votre assistant</h2><p>Une adresse pour gérer vos articles, votre design et vos outils métier.</p><p><code>'.e($cfg['url'].'/mcp').'</code></p><p>Dans ChatGPT, ajoutez un serveur MCP personnalisé avec OAuth. Connectez-vous avec votre mot de passe habituel du site.</p></div><h2>Que peut faire votre IA ?</h2><form method="post">'.csrf();
+    foreach(['read'=>['Consultation','Lire les contenus, le design et les données des modules approuvés.'],'manage'=>['Gestion du site','Créer et publier des articles, refaire la présentation et utiliser vos outils métier.'],'build'=>['Création de fonctionnalités','Toutes les capacités précédentes, plus les animations JS, templates HTML, vues et applications PHP/SQLite. Chaque déploiement nécessite votre accord.']] as $k=>$v){
         $body.='<label class="panel"><input style="display:inline;width:auto" type="radio" name="profile" value="'.$k.'" '.($profile===$k?'checked':'').'> <strong>'.e($v[0]).'</strong><br>'.e($v[1]).'</label>';
     }
     $body.='<label><input style="width:auto;display:inline" type="checkbox" name="accept_php" value="1"> Pour la création de fonctionnalités, je comprends que le PHP approuvé possède les droits de mon hébergement.</label><button name="action" value="ai_profile">Enregistrer mon choix</button></form><h2>Modifications proposées</h2>';
@@ -161,11 +303,11 @@ function tipiAdminPanel(string $data,array $cfg): string {
     }
     if(!$count)$body.='<p>Aucune modification en attente.</p>';
     $body.='<h2>Fonctionnalités de votre site</h2>';
-    foreach(tipiBusinessManifest(dirname(__DIR__)) as $file=>$hash){
-        $approved=($cfg['business_approved'][$file]??'')===$hash;
-        $body.='<div class="panel"><strong>'.e(basename($file,'.php')).'</strong><p>'.($approved?'Active':'Version à approuver').'</p>';
+    foreach(tipiExtensionManifest(dirname(__DIR__)) as $file=>$hash){
+        $approved=tipiApprovedFile(dirname(__DIR__),$cfg,$file)!==null;
+        $body.='<div class="panel"><strong>'.e($file).'</strong><p>'.($approved?'Active':'Version à approuver').'</p>';
         if(!$approved){
-            $source=file_get_contents(dirname(__DIR__).'/app/McpActions/'.$file);
+            $source=file_get_contents(dirname(__DIR__).'/'.$file);
             $body.='<details><summary>Afficher le code de cette version</summary><pre>'.e((string)$source).'</pre></details><form method="post">'.csrf().'<input type="hidden" name="module" value="'.e($file).'"><input type="hidden" name="sha256" value="'.e($hash).'">'.field('owner_password','Votre mot de passe','','password').'<button name="action" value="ai_approve_module">Approuver cette fonctionnalité</button></form>';
         }
         $body.='</div>';
@@ -190,7 +332,7 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
     if(!is_array($p))return tipiRpcError($id,-32602,'Invalid params');
     if($method==='initialize'){
         $v=$p['protocolVersion']??'2025-11-25';
-        return tipiRpc($id,['protocolVersion'=>in_array($v,['2025-11-25','2025-06-18','2025-03-26'],true)?$v:'2025-11-25','capabilities'=>['tools'=>['listChanged'=>false]],'serverInfo'=>['name'=>'tipi-cms','version'=>TIPI_VERSION],'instructions'=>'Vous pilotez Tipi CMS. Appelez cms_site_info pour connaître les droits actuels. Présentez au membre les possibilités autorisées : créer des articles et pages, gérer le SEO, refaire le design public via cms_get_design/cms_update_design (CSS et dispositions), utiliser et créer des fonctions métier. Pour développer, inspectez app/McpActions et préparez puis validez un patch. Demandez au propriétaire de vérifier puis installer et activer le patch dans /admin?connections=1. Seules les versions approuvées deviennent actives. Ne déployez pas directement. Enregistrez les actions avec CGF ActionRegistry et TipiBusinessContext pour SQLite à la demande. Appelez cg_app_catalog puis cg_app_invoke pour les nouveaux outils. Pas de modification du noyau, des secrets ou de commande système. Les permissions réelles priment sur ces instructions.']);
+        return tipiRpc($id,['protocolVersion'=>in_array($v,['2025-11-25','2025-06-18','2025-03-26'],true)?$v:'2025-11-25','capabilities'=>['tools'=>['listChanged'=>false]],'serverInfo'=>['name'=>'tipi-cms','version'=>TIPI_VERSION],'instructions'=>'Vous pilotez Tipi CMS. Appelez cms_site_info pour connaître les droits actuels. Présentez au membre les possibilités autorisées : créer des articles et pages, gérer le SEO, refaire le design public via cms_get_design/cms_update_design (CSS et dispositions), utiliser et créer des fonctions métier. Pour développer, appelez cms_developer_guide puis inspectez les dossiers autorisés. Préparez et validez un patch. Le CMS accepte layouts/templates HTML, CSS, JavaScript, contrôleurs, vues, routes, services et actions MCP. Demandez au propriétaire de vérifier puis installer et activer le patch dans /admin?connections=1. Seules les versions approuvées deviennent actives. Ne déployez pas directement. Enregistrez les actions avec CGF ActionRegistry et TipiBusinessContext pour SQLite à la demande. Appelez cg_app_catalog puis cg_app_invoke pour les nouveaux outils. Pas de modification du noyau, des secrets ou de commande système. Les permissions réelles priment sur ces instructions.']);
     }
     if($method==='ping')return tipiRpc($id,(object)[]);
     if(in_array($method,['resources/list','prompts/list'],true))return tipiRpc($id,[explode('/',$method)[0]=>[]]);
@@ -212,6 +354,7 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
             catch(Throwable $ex){error_log('Tipi business registry unavailable: '.get_class($ex));}
         }
         if(!$canRead)$defs=array_merge($defs,array_values(array_filter(mcpTools(),fn($t)=>$t['name']==='cms_site_info')));
+        if($cfg['oauth_development'])$defs[]=['name'=>'cms_developer_guide','description'=>'Contrats et exemples pour développer des applications et thèmes Tipi CMS. À lire avant un patch.','inputSchema'=>['type'=>'object','properties'=>(object)[],'additionalProperties'=>false]];
         return tipiRpc($id,['tools'=>$defs]);
     }
     if($method!=='tools/call'||!is_string($p['name']??null)||!is_array($p['arguments']??[]))return tipiRpcError($id,-32602,'Invalid tool call');
@@ -236,6 +379,10 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
             return tipiToolResult($id,$registry->run($key,$args,['role'=>'admin','id'=>1]));
         }catch(Throwable $ex){error_log('Tipi business action refused: '.get_class($ex));return tipiToolError($id,$ex instanceof \CGF\HttpError?$ex->getMessage():'Action métier indisponible');}
     }
+    if($name==='cms_developer_guide'){
+        if(!$cfg['oauth_development'])return tipiToolError($id,'Profil développement et scopes requis');
+        return tipiToolResult($id,['guide'=>(string)file_get_contents(__DIR__.'/developer-guide.md'),'directories'=>tipiDevDirs(),'routes'=>array_values(tipiRoutes($root,$cfg))]);
+    }
     if(str_starts_with($name,'cms_')){
         if($name==='cms_site_info'){
             $info=mcpCall($data,$cfg,$name,[]);
@@ -257,8 +404,11 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
     // Restrict actual CodeGraft path permissions, even if the owner sets a broader allowlist.
     $policy=$system['vault']->policy();
     foreach(array_merge($policy['read_dirs']??[],$policy['write_dirs']??[]) as $dir)
-        if(!is_string($dir)||!preg_match('~^app/McpActions(?:/[A-Za-z0-9_-]+)*$~D',$dir))
+        if(!is_string($dir)||!in_array($dir,tipiDevDirs(),true))
             return tipiToolError($id,'Réenregistrez le profil Création de fonctionnalités dans Assistant IA.');
+    if(in_array($name,['cg_prepare_patch','cg_prepare_diff'],true)){
+        foreach($args['files']??[] as $file)if(!is_array($file)||!tipiDevPath((string)($file['path']??'')))return tipiToolError($id,'Fichier hors espace de développement autorisé');
+    }
     return $system['mcp']->dispatch($request,$principal);
 }
 function tipiCodeGraftRoute(string $path,string $data,array $cfg): void {
@@ -280,7 +430,7 @@ function tipiCodeGraftRoute(string $path,string $data,array $cfg): void {
     require __DIR__.'/codegraft/standalone/bootstrap.php';
     $oauth=new \CodeGraft\OAuthHttp($codegraft['vault']);
     $path=rtrim($path,'/');
-    $routes=['/.well-known/oauth-authorization-server'=>'metadata','/.well-known/oauth-protected-resource'=>'protectedResource','/.well-known/oauth-protected-resource/codegraft-api'=>'protectedResource','/codegraft-api/oauth/register'=>'register','/codegraft-api/oauth/authorize'=>'authorize','/codegraft-api/oauth/token'=>'token'];
+    $routes=['/.well-known/oauth-authorization-server'=>'metadata','/.well-known/oauth-protected-resource'=>'protectedResource','/.well-known/oauth-protected-resource/codegraft-api'=>'protectedResource','/.well-known/oauth-protected-resource/mcp'=>'protectedResource','/mcp/oauth/register'=>'register','/mcp/oauth/authorize'=>'authorize','/mcp/oauth/token'=>'token','/codegraft-api/oauth/register'=>'register','/codegraft-api/oauth/authorize'=>'authorize','/codegraft-api/oauth/token'=>'token'];
     if(isset($routes[$path])){
         $method=$_SERVER['REQUEST_METHOD']??'GET';$action=$routes[$path];
         if(!in_array($method,match($action){'register','token'=>['POST'],'authorize'=>['GET','POST'],default=>['GET']},true)){http_response_code(405);return;}
@@ -302,7 +452,7 @@ function tipiCodeGraftRoute(string $path,string $data,array $cfg): void {
     $principal=null;
     if(preg_match('~^Bearer (\S+)$~D',$auth,$m))$principal=(new \CodeGraft\DynamicOAuth($codegraft['vault']))->principal($m[1]);
     if($principal===null){
-        header('WWW-Authenticate: Bearer resource_metadata="'.$cfg['url'].'/.well-known/oauth-protected-resource/codegraft-api", scope="codegraft:read codegraft:write app:read app:write"');
+        header('WWW-Authenticate: Bearer resource_metadata="'.$cfg['url'].'/.well-known/oauth-protected-resource/mcp", scope="codegraft:read codegraft:write app:read app:write"');
         jsonout(['error'=>'unauthorized'],401);
     }
     if(($_SERVER['REQUEST_METHOD']??'')!=='POST'){header('Allow: POST');jsonout(['error'=>'method_not_allowed'],405);}
