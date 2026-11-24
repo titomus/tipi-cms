@@ -222,6 +222,80 @@ function tipiSystem(): array {
     require __DIR__.'/codegraft/standalone/bootstrap.php';
     return $codegraft;
 }
+// A host confirmation is not an authenticated human approval receipt. Only the
+// owner may opt in to delegated deployment; CMS mode remains fail-closed.
+function tipiApprovalMode(array $cfg): string {
+    $mode=$cfg['ai_approval_mode']??'cms';
+    return in_array($mode,['cms','chat','auto'],true)?$mode:'cms';
+}
+function tipiPatchReview(array $cg,string $id,string $operation): array {
+    if(!preg_match('~^[a-f0-9]{32}$~D',$id)||!in_array($operation,['deploy','rollback'],true))fail('Version invalide');
+    $record=$cg['vault']->json(($operation==='deploy'?'drafts/':'releases/').$id.'.json');
+    if(($record['status']??'')!==($operation==='deploy'?'prepared':'deployed')||($operation==='deploy'&&($record['expires_at']??0)<time()))fail('Version indisponible ou expirée',409);
+    if(empty($record['files']))fail('Aucun fichier',409);
+    foreach($record['files'] as $entry){
+        if(!tipiDevPath((string)($entry['path']??''))||($entry['operation']??'replace')!=='replace')fail('Fichier hors espace de développement',403);
+        if($operation==='deploy'&&dirname($entry['path'])==='app/Routes'){
+            $route=json_decode($entry['content']??'',true,16,JSON_THROW_ON_ERROR);
+            if(!is_array($route)||!is_string($route['path']??null)||!preg_match('~^/(?:admin/)?apps/[a-z0-9][a-z0-9-]{0,70}$~D',$route['path'])||!is_string($route['handler']??null)||dirname($route['handler'])!=='app/Controllers'||!tipiDevPath($route['handler'])||!is_string($route['title']??null))fail('Déclaration de route invalide');
+        }
+    }
+    $validation=$operation==='deploy'?$cg['workspace']->validate($id):['valid'=>true,'warning'=>'Les empreintes seront vérifiées par CodeGraft au moment de la restauration.'];
+    return ['id'=>$id,'operation'=>$operation,'summary'=>$record['summary']??'','fingerprint'=>hash('sha256',json_encode($record,JSON_THROW_ON_ERROR)),'files'=>array_map(static fn($e)=>['path'=>$e['path'],'before_sha256'=>$e['before_sha256'],'after_sha256'=>$e['after_sha256']],$record['files']),'validation'=>$validation,'rollback_available'=>$operation==='deploy','database_restored'=>false];
+}
+function tipiApplyRelease(string $data,array $cg,string $id,string $operation,string $fingerprint,string $channel): array {
+    // Serialize profile changes, activation and rollback in the CMS lock.
+    // Workspace also locks its own vault, in the same lock order as ai_profile.
+    return locked($data,function()use($data,$cg,$id,$operation,$fingerprint,$channel){
+        $c=jread($data.'/config.json');$mode=tipiApprovalMode($c);
+        if(($c['ai_profile']??'read')!=='build')fail('Profil développement désactivé',403);
+        if($channel==='oauth'&&$mode==='cms')fail('Validation dans le CMS obligatoire',403);
+        $review=tipiPatchReview($cg,$id,$operation);
+        if(!hash_equals($review['fingerprint'],$fingerprint))fail('Version modifiée : refaire la revue',409);
+        if(empty($review['validation']['valid']))fail('Le patch ne passe pas les contrôles',409);
+        $root=dirname(__DIR__);$history=$data.'/extension-releases/'.$id.'.json';
+        $record=$cg['vault']->json(($operation==='deploy'?'drafts/':'releases/').$id.'.json');
+        if($operation==='deploy'){
+            $prior=[];
+            foreach($record['files'] as $entry){
+                $p=$entry['path'];
+                if(tipiApprovedFile($root,$c,$p)!==null)$prior[$p]=$entry['before_sha256'];
+            }
+            // Only previously approved exact versions may be reactivated by rollback.
+            jwrite($history,['id'=>$id,'prior_approved'=>$prior,'mode'=>$mode,'channel'=>$channel,'review_sha256'=>$fingerprint,'at'=>gmdate('c')]);
+            $result=$cg['workspace']->deploy($id,true);
+            $current=tipiExtensionManifest($root);
+            foreach($record['files'] as $entry){
+                $p=$entry['path'];$hash=$entry['after_sha256'];
+                if(isset($current[$p])&&hash_equals($current[$p],$hash))$c['extension_approved'][$p]=$hash;
+                else unset($c['extension_approved'][$p]);
+            }
+        }else{
+            $prior=jread($history)['prior_approved']??[];
+            $result=$cg['workspace']->rollback($id,true);
+            $current=tipiExtensionManifest($root);
+            foreach($record['files'] as $entry){
+                $p=$entry['path'];unset($c['extension_approved'][$p]);
+                if(dirname($p)==='app/McpActions')unset($c['business_approved'][basename($p)]);
+                if(isset($prior[$p],$current[$p])&&hash_equals($prior[$p],$current[$p])&&hash_equals($entry['before_sha256'],$current[$p]))$c['extension_approved'][$p]=$current[$p];
+            }
+        }
+        jwrite($data.'/config.json',$c);
+        $result['approval_mode']=$mode;$result['channel']=$channel;$result['database_restored']=false;
+        $result['human_approval_verified']=$channel==='cms'; // authenticated password + CSRF, never inferred from a tool argument
+        return $result;
+    });
+}
+function tipiReleaseTools(): array {
+    $id=['type'=>'string','pattern'=>'^[a-f0-9]{32}$','description'=>'Identifiant du patch ou de la version'];
+    $schema=static fn($properties,$required)=>['type'=>'object','properties'=>$properties,'required'=>$required,'additionalProperties'=>false];
+    $fingerprint=['type'=>'string','pattern'=>'^[a-f0-9]{64}$','description'=>'Empreinte exacte obtenue avec cg_review_release, jamais inventée.'];
+    return [
+        ['name'=>'cg_review_release','title'=>'Vérifier une modification','description'=>'Revue technique sans déploiement : résumé, fichiers, empreinte exacte, contrôles. Lire avant toute installation ou restauration.','inputSchema'=>$schema(['id'=>$id,'operation'=>['type'=>'string','enum'=>['deploy','rollback']]],['id','operation']),'annotations'=>['readOnlyHint'=>true,'destructiveHint'=>false,'openWorldHint'=>false]],
+        ['name'=>'cg_deploy_patch','title'=>'Installer et activer le patch','description'=>'Action à effet réel : déploie et active le patch exact, avec sauvegarde du code. En mode chat, présentez le résumé et obtenez une validation explicite du membre dans la conversation avant cet appel. En mode auto, suivez la demande du membre. En mode CMS, refus serveur. Ne pas appeler si refus.','inputSchema'=>$schema(['id'=>$id,'fingerprint'=>$fingerprint],['id','fingerprint']),'annotations'=>['readOnlyHint'=>false,'destructiveHint'=>true,'idempotentHint'=>false,'openWorldHint'=>true]],
+        ['name'=>'cg_rollback_patch','title'=>'Restaurer une version du site','description'=>'Action à effet réel : restaure le code précédent, pas la base SQLite. En mode chat, demander la validation explicite du membre avant appel. Mode CMS : refus serveur. Utiliser la revue rollback et son empreinte.','inputSchema'=>$schema(['id'=>$id,'fingerprint'=>$fingerprint],['id','fingerprint']),'annotations'=>['readOnlyHint'=>false,'destructiveHint'=>true,'idempotentHint'=>false,'openWorldHint'=>true]]
+    ];
+}
 function tipiAdminAction(string $data,array $cfg,string $action,array $post): void {
     $cg=tipiSystem();$vault=$cg['vault'];
     if($action==='ai_profile'){
@@ -231,9 +305,20 @@ function tipiAdminAction(string $data,array $cfg,string $action,array $post): vo
         locked($data,function()use($data,$profile,$vault){
             $c=jread($data.'/config.json');
             $vault->locked(fn()=>$vault->savePolicy(tipiAiPolicy($profile)));
-            $c['ai_profile']=$profile;
+            $c['ai_profile']=$profile;if($profile!=='build')$c['ai_approval_mode']='cms';
             $c['business_read']=true;$c['business_write']=$profile!=='read';
             jwrite($data.'/config.json',$c);
+        });return;
+    }
+    if($action==='ai_approval_mode'){
+        $mode=$post['approval_mode']??'';
+        if(!in_array($mode,['cms','chat','auto'],true))fail('Mode inconnu');
+        if(!password_verify((string)($post['owner_password']??''),$cfg['password_hash'])){usleep(400000);fail('Mot de passe incorrect',403);}
+        if($mode!=='cms'&&($post['accept_delegation']??'')!=='1')fail('Confirmez la délégation de déploiement');
+        locked($data,function()use($data,$mode){
+            $c=jread($data.'/config.json');
+            if($mode!=='cms'&&($c['ai_profile']??'read')!=='build')fail('Activez le profil Création de fonctionnalités',403);
+            $c['ai_approval_mode']=$mode;jwrite($data.'/config.json',$c);
         });return;
     }
     if($action==='ai_revoke'){
@@ -277,39 +362,12 @@ function tipiAdminAction(string $data,array $cfg,string $action,array $post): vo
     $id=(string)($post['patch']??'');
     if(!preg_match('~^[a-f0-9]{32}$~D',$id))fail('Version invalide');
     if(!password_verify((string)($post['owner_password']??''),$cfg['password_hash']))fail('Mot de passe incorrect',403);
-    if($action==='ai_deploy'){
-        $draft=$vault->json('drafts/'.$id.'.json');
-        if(!hash_equals(hash('sha256',json_encode($draft,JSON_THROW_ON_ERROR)),(string)($post['fingerprint']??'')))fail('Patch modifié : rechargez',409);
-        foreach($draft['files']??[] as $entry)if(!tipiDevPath((string)($entry['path']??''))||($entry['operation']??'replace')!=='replace')fail('Fichier hors espace de développement',403);
-        foreach($draft['files']??[] as $entry)if(dirname($entry['path'])==='app/Routes'){
-            $route=json_decode($entry['content']??'',true,16,JSON_THROW_ON_ERROR);
-            if(!is_array($route)||!is_string($route['path']??null)||!preg_match('~^/(?:admin/)?apps/[a-z0-9][a-z0-9-]{0,70}$~D',$route['path'])||!is_string($route['handler']??null)||dirname($route['handler'])!=='app/Controllers'||!tipiDevPath($route['handler'])||!is_string($route['title']??null))fail('Déclaration de route invalide');
-        }
-        $result=$cg['workspace']->validate($id);if(empty($result['valid']))fail('Le patch ne passe pas les contrôles');
-        $cg['workspace']->deploy($id,true);
-        // The owner explicitly approved the code shown in this exact patch.
-        // Activate only these deployed versions, never unrelated pending modules.
-        locked($data,function()use($data,$draft){
-            $c=jread($data.'/config.json');if(($c['ai_profile']??'read')!=='build')return;
-            $current=tipiExtensionManifest(dirname(__DIR__));
-            foreach($draft['files'] as $entry){
-                $file=$entry['path'];$hash=$entry['after_sha256'];
-                if(isset($current[$file])&&hash_equals($current[$file],$hash))$c['extension_approved'][$file]=$hash;
-            }
-            jwrite($data.'/config.json',$c);
-        });
-    }elseif($action==='ai_rollback'){
-        $release=$vault->json('releases/'.$id.'.json');
-        $cg['workspace']->rollback($id,true);
-        locked($data,function()use($data,$release){
-            $c=jread($data.'/config.json');$m=tipiExtensionManifest(dirname(__DIR__));
-            foreach($release['files']??[] as $entry){
-                $p=$entry['path'];unset($c['extension_approved'][$p]);
-                // A restored source must be reviewed again before execution.
-                if(dirname($p)==='app/McpActions')unset($c['business_approved'][basename($p)]);
-            }
-            jwrite($data.'/config.json',$c);
-        });
+    if($action==='ai_deploy'||$action==='ai_rollback'){
+        $operation=$action==='ai_deploy'?'deploy':'rollback';
+        $fingerprint=(string)($post['fingerprint']??'');
+        // Existing authenticated rollback form can use the current release fingerprint.
+        if($operation==='rollback'&&$fingerprint==='')$fingerprint=tipiPatchReview($cg,$id,$operation)['fingerprint'];
+        tipiApplyRelease($data,$cg,$id,$operation,$fingerprint,'cms');
     }
 }
 function tipiAdminPanel(string $data,array $cfg): string {
@@ -318,7 +376,13 @@ function tipiAdminPanel(string $data,array $cfg): string {
     foreach(['read'=>['Consultation','Lire les contenus, le design et les données des modules approuvés.'],'manage'=>['Gestion du site','Créer et publier des articles, refaire la présentation et utiliser vos outils métier.'],'build'=>['Création de fonctionnalités','Toutes les capacités précédentes, plus les animations JS, templates HTML, vues et applications PHP/SQLite. Chaque déploiement nécessite votre accord.']] as $k=>$v){
         $body.='<label class="panel"><input style="display:inline;width:auto" type="radio" name="profile" value="'.$k.'" '.($profile===$k?'checked':'').'> <strong>'.e($v[0]).'</strong><br>'.e($v[1]).'</label>';
     }
-    $body.='<label><input style="width:auto;display:inline" type="checkbox" name="accept_php" value="1"> Pour la création de fonctionnalités, je comprends que le PHP approuvé possède les droits de mon hébergement.</label><button name="action" value="ai_profile">Enregistrer mon choix</button></form><h2>Modifications proposées</h2>';
+    $body.='<label><input style="width:auto;display:inline" type="checkbox" name="accept_php" value="1"> Pour la création de fonctionnalités, je comprends que le PHP approuvé possède les droits de mon hébergement.</label><button name="action" value="ai_profile">Enregistrer mon choix</button></form>';
+    $mode=tipiApprovalMode($cfg);
+    $body.='<h2>Validation des développements</h2><form method="post">'.csrf();
+    foreach(['chat'=>['Dans ChatGPT (recommandé)','Votre assistant demande votre accord dans la conversation ; la confirmation est gérée par le client MCP. Le serveur délègue le déploiement au client autorisé.'],'auto'=>['Autonomie','Votre assistant peut installer les modifications dans son périmètre sans validation CMS supplémentaire. Les confirmations imposées par ChatGPT restent applicables.'],'cms'=>['Dans le CMS (contrôle strict)','Le serveur refuse tout déploiement MCP. Vous validez dans cette page avec votre mot de passe.']] as $key=>$v){
+        $body.='<label class="panel"><input style="width:auto;display:inline" type="radio" name="approval_mode" value="'.$key.'" '.($mode===$key?'checked':'').'> <strong>'.e($v[0]).'</strong><br>'.e($v[1]).'</label>';
+    }
+    $body.='<p>Les contrôles de fichiers, les sauvegardes et l’historique restent actifs. Le mode ChatGPT ne fournit pas de preuve humaine cryptographique au CMS. Le PHP personnalisé peut agir avec les droits de votre hébergement.</p><label><input style="width:auto;display:inline" type="checkbox" name="accept_delegation" value="1"> J’autorise mon client MCP authentifié à déployer du code dans le périmètre permis.</label>'.field('owner_password','Votre mot de passe','','password').'<button name="action" value="ai_approval_mode">Enregistrer le mode de validation</button></form><h2>Modifications proposées</h2>';
     $files=glob($vault->directory.'/drafts/*.json')?:[];usort($files,fn($a,$b)=>filemtime($b)<=>filemtime($a));$count=0;
     foreach(array_slice($files,0,50) as $f){
         $id=basename($f,'.json');if(!preg_match('~^[a-f0-9]{32}$~D',$id))continue;
@@ -362,7 +426,7 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
     if(!is_array($p))return tipiRpcError($id,-32602,'Invalid params');
     if($method==='initialize'){
         $v=$p['protocolVersion']??'2025-11-25';
-        return tipiRpc($id,['protocolVersion'=>in_array($v,['2025-11-25','2025-06-18','2025-03-26'],true)?$v:'2025-11-25','capabilities'=>['tools'=>['listChanged'=>false]],'serverInfo'=>['name'=>'tipi-cms','version'=>TIPI_VERSION],'instructions'=>'Vous pilotez Tipi CMS. Appelez cms_site_info pour connaître les droits actuels. Présentez au membre les possibilités autorisées : créer des articles et pages, gérer le SEO, refaire le design public via cms_get_design/cms_update_design (CSS et dispositions), utiliser et créer des fonctions métier. Pour développer, appelez cms_developer_guide puis inspectez les dossiers autorisés. Préparez et validez un patch. Le CMS accepte layouts/templates HTML, CSS, JavaScript, contrôleurs, vues, routes, services et actions MCP. Demandez au propriétaire de vérifier puis installer et activer le patch dans /admin?connections=1. Seules les versions approuvées deviennent actives. Ne déployez pas directement. Enregistrez les actions avec CGF ActionRegistry et TipiBusinessContext pour SQLite à la demande. Appelez cg_app_catalog puis cg_app_invoke pour les nouveaux outils. Pas de modification du noyau, des secrets ou de commande système. Les permissions réelles priment sur ces instructions.']);
+        return tipiRpc($id,['protocolVersion'=>in_array($v,['2025-11-25','2025-06-18','2025-03-26'],true)?$v:'2025-11-25','capabilities'=>['tools'=>['listChanged'=>false]],'serverInfo'=>['name'=>'tipi-cms','version'=>TIPI_VERSION],'instructions'=>'Vous pilotez Tipi CMS. Appelez cms_site_info pour connaître les droits actuels. Présentez au membre les possibilités autorisées : créer des articles et pages, gérer le SEO, refaire le design public via cms_get_design/cms_update_design (CSS et dispositions), utiliser et créer des fonctions métier. Pour développer, appelez cms_developer_guide puis inspectez les dossiers autorisés. Préparez et validez un patch. Le CMS accepte layouts/templates HTML, CSS, JavaScript, contrôleurs, vues, routes, services et actions MCP. Appelez cg_review_release pour obtenir la revue et l’empreinte du patch. Respectez approval_mode retourné par cms_site_info : cms = validation dans /admin?connections=1 ; chat = présentez le résumé, les risques et attendez l’accord explicite du membre dans cette conversation, puis cg_deploy_patch ; auto = déployez dans le cadre de la demande autorisée, sous réserve des confirmations du client. Ne prétendez pas que le client a reçu une validation si ce n’est pas le cas. Même principe pour cg_rollback_patch. Enregistrez les actions avec CGF ActionRegistry et TipiBusinessContext pour SQLite à la demande. Appelez cg_app_catalog puis cg_app_invoke pour les nouveaux outils. Pas de modification du noyau, des secrets ou de commande système. Les permissions réelles priment sur ces instructions.']);
     }
     if($method==='ping')return tipiRpc($id,(object)[]);
     if(in_array($method,['resources/list','prompts/list'],true))return tipiRpc($id,[explode('/',$method)[0]=>[]]);
@@ -385,6 +449,7 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
         }
         if(!$canRead)$defs=array_merge($defs,array_values(array_filter(mcpTools(),fn($t)=>$t['name']==='cms_site_info')));
         if($cfg['oauth_development'])$defs[]=['name'=>'cms_developer_guide','description'=>'Contrats et exemples pour développer des applications et thèmes Tipi CMS. À lire avant un patch.','inputSchema'=>['type'=>'object','properties'=>(object)[],'additionalProperties'=>false]];
+        if($cfg['oauth_development'])$defs=array_merge($defs,tipiReleaseTools());
         return tipiRpc($id,['tools'=>$defs]);
     }
     if($method!=='tools/call'||!is_string($p['name']??null)||!is_array($p['arguments']??[]))return tipiRpcError($id,-32602,'Invalid tool call');
@@ -409,6 +474,27 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
             return tipiToolResult($id,$registry->run($key,$args,['role'=>'admin','id'=>1]));
         }catch(Throwable $ex){error_log('Tipi business action refused: '.get_class($ex));return tipiToolError($id,$ex instanceof \CGF\HttpError?$ex->getMessage():'Action métier indisponible');}
     }
+    if(in_array($name,['cg_review_release','cg_deploy_patch','cg_rollback_patch'],true)){
+        if(!$cfg['oauth_development'])return tipiToolError($id,'Profil développement et scopes lecture/écriture requis');
+        try{
+            $idArg=$args['id']??null;
+            if(!is_string($idArg))fail('Identifiant requis');
+            if($name==='cg_review_release'){
+                if(count($args)!==2||!is_string($args['operation']??null))fail('Opération requise');
+                $review=tipiPatchReview($system,$idArg,$args['operation']);
+                $review['approval_mode']=tipiApprovalMode($cfg);
+                $review['human_approval_verified']=false;
+                return tipiToolResult($id,$review);
+            }
+            if(count($args)!==2||!is_string($args['fingerprint']??null))fail('Empreinte de revue requise');
+            $result=tipiApplyRelease($data,$system,$idArg,$name==='cg_deploy_patch'?'deploy':'rollback',$args['fingerprint'],'oauth');
+            \CodeGraft\AuditLog::record($system['vault'],$name,true,'oauth');
+            return tipiToolResult($id,$result);
+        }catch(Throwable $ex){
+            \CodeGraft\AuditLog::record($system['vault'],$name,false,'oauth');
+            return tipiToolError($id,$ex instanceof RuntimeException&&$ex->getCode()>=400&&$ex->getCode()<500?$ex->getMessage():'Modification refusée ou indisponible ; vérifiez les empreintes, la politique et l’historique.');
+        }
+    }
     if($name==='cms_developer_guide'){
         if(!$cfg['oauth_development'])return tipiToolError($id,'Profil développement et scopes requis');
         return tipiToolResult($id,['guide'=>(string)file_get_contents(__DIR__.'/developer-guide.md'),'directories'=>tipiDevDirs(),'routes'=>array_values(tipiRoutes($root,$cfg))]);
@@ -422,6 +508,9 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
             $info['business']['write']=$canRead&&$canWrite&&!empty($cfg['business_write']);
             $info['business']['development']=$cfg['oauth_development'];
             $info['design']['read']=$canRead;
+            $info['approval_mode']=tipiApprovalMode($cfg);
+            $info['remote_deploy']=$cfg['oauth_development']&&tipiApprovalMode($cfg)!=='cms';
+            $info['approval_note']='Chat : confirmation gérée par le client MCP ; aucune preuve humaine transmise au serveur. CMS : validation authentifiée obligatoire.';
             return tipiToolResult($id,$info);
         }
         if(!$canRead)return tipiToolError($id,'Scope app:read requis');
