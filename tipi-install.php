@@ -574,15 +574,73 @@ function changeDesign(string $d,array $values,string $expected): array {
     });
 }
 // Native Tipi integration: independent of editable themes and extensions.
+const TIPI_HUB_ORIGIN='https://le-tipi.club';
 const TIPI_ANALYTICS_ORIGIN='https://analitycs.le-tipi.club';
 const TIPI_OPTIMIZE_ORIGIN='https://optimize.le-tipi.club';
 function tipiHubConfig(string $d): array {return jread($d.'/hub.json');}
+// Private, server-to-server transport. Never forward Hub credentials to browser JS.
+function tipiHubRequest(string $method,string $path,array $payload=[],array $headers=[]): array {
+    if(!function_exists('curl_init'))fail('Extension PHP cURL requise pour la connexion au Tipi',503);
+    $ch=curl_init(TIPI_HUB_ORIGIN.'/api/plugin/v1/'.$path);
+    $headers[]='Accept: application/json';
+    $options=[CURLOPT_RETURNTRANSFER=>true,CURLOPT_CUSTOMREQUEST=>$method,CURLOPT_CONNECTTIMEOUT=>4,CURLOPT_TIMEOUT=>10,CURLOPT_FOLLOWLOCATION=>false];
+    if($method==='POST'){$headers[]='Content-Type: application/json';$options[CURLOPT_POSTFIELDS]=json_encode($payload,JSON_THROW_ON_ERROR);}
+    $options[CURLOPT_HTTPHEADER]=$headers;
+    curl_setopt_array($ch,$options);$raw=curl_exec($ch);$status=(int)curl_getinfo($ch,CURLINFO_RESPONSE_CODE);curl_close($ch);
+    $result=is_string($raw)?json_decode($raw,true):null;
+    if(!is_array($result)||$status<200||$status>=300||($result['status']??'')!=='ok'){
+        if(in_array($status,[401,403],true))fail('Connexion au Tipi refusée ou révoquée',$status);
+        fail('Le Tipi est momentanément indisponible ou la demande a expiré. Réessayez.',503);
+    }
+    return $result;
+}
+function tipiHubPairing(string $d,array $cfg,string $action): void {
+    locked($d,function()use($d,$cfg,$action){
+        $h=tipiHubConfig($d);$h['installation_uid']=$h['installation_uid']??bin2hex(random_bytes(16));
+        if($action==='hub_pair_start'){
+            if(!empty($h['access_token']))fail('Déconnectez le site avant de le réassocier',409);
+            $p=tipiHubRequest('POST','pairings/init',['platform'=>'tipi_cms','site_url'=>$cfg['url'],'installation_uid'=>$h['installation_uid'],'plugin_version'=>TIPI_VERSION])['pairing']??[];
+            if(!preg_match('~^[a-f0-9]{24}$~D',(string)($p['public_id']??''))||!preg_match('~^[a-f0-9]{48}$~D',(string)($p['poll_token']??''))||!preg_match('~^[A-Z2-9]{6}$~D',(string)($p['pairing_code']??'')))fail('Réponse de jumelage invalide',502);
+            $h['pairing']=['public_id'=>$p['public_id'],'poll_token'=>$p['poll_token'],'pairing_code'=>$p['pairing_code']];
+        }elseif($action==='hub_pair_finish'){
+            $p=$h['pairing']??[];
+            if(empty($p['public_id'])||empty($p['poll_token']))fail('Lancez d’abord une connexion',409);
+            $result=tipiHubRequest('GET','pairings/'.rawurlencode($p['public_id']),[],['X-Tipi-Poll-Token: '.$p['poll_token']])['pairing']??[];
+            if(($result['status']??'')==='pending')fail('Autorisez d’abord le site dans le Hub',409);
+            if(($result['status']??'')!=='approved'){
+                unset($h['pairing']);jwrite($d.'/hub.json',$h);fail('Demande expirée ou déjà utilisée. Relancez la connexion.',409);
+            }
+            if(($result['platform']??'')!=='tipi_cms'||!preg_match('~^ltcms_[a-f0-9]{48}$~D',(string)($result['access_token']??''))||!preg_match('~^[a-zA-Z0-9_-]{16,128}$~D',(string)($result['tracker_key']??''))||(int)($result['site_id']??0)<=0)fail('Réponse de connexion invalide',502);
+            $h['access_token']=$result['access_token'];$h['site_id']=(int)$result['site_id'];$h['tracker_key']=$result['tracker_key'];
+            $h['analytics']=true;$h['optimize']=false;$h['consent_epoch']=bin2hex(random_bytes(12));unset($h['pairing']);
+        }elseif($action==='hub_refresh'||$action==='hub_disconnect'){
+            if(!empty($h['access_token'])){
+                try{
+                    $headers=['Authorization: Bearer '.$h['access_token']];
+                    if($action==='hub_disconnect'){tipiHubRequest('POST','revoke',[],$headers);}
+                    else{
+                        $site=tipiHubRequest('GET','site-config',[],$headers)['site']??[];
+                        if(($site['platform']??'')!=='tipi_cms'||(int)($site['site_id']??0)!==(int)$h['site_id']||!preg_match('~^[a-zA-Z0-9_-]{16,128}$~D',(string)($site['tracker_key']??'')))fail('Configuration Hub incohérente',502);
+                        if($site['tracker_key']!==$h['tracker_key']){$h['tracker_key']=$site['tracker_key'];$h['consent_epoch']=bin2hex(random_bytes(12));}
+                    }
+                }catch(RuntimeException $ex){
+                    if(!in_array($ex->getCode(),[401,403],true))throw $ex;
+                    $action='hub_disconnect';
+                }
+            }
+            if($action==='hub_disconnect'){
+                unset($h['access_token'],$h['site_id'],$h['pairing']);$h['tracker_key']='';$h['analytics']=false;$h['optimize']=false;$h['consent_epoch']=bin2hex(random_bytes(12));
+            }
+        }
+        jwrite($d.'/hub.json',$h);
+    });
+}
 function tipiHubEnabled(array $h): bool {return ($h['analytics']??false)===true&&is_string($h['tracker_key']??null)&&preg_match('~^[a-zA-Z0-9_-]{16,128}$~D',$h['tracker_key'])===1;}
 function tipiHubBinding(array $h): string {return substr(hash('sha256',($h['installation_uid']??'').'|'.($h['consent_epoch']??'').'|'.($h['tracker_key']??'').'|'.(!empty($h['optimize'])?'1':'0')),0,32);}
 function tipiHubConsent(array $h): bool {return tipiHubEnabled($h)&&hash_equals(tipiHubBinding($h).'.yes',(string)($_COOKIE['tipi_metrics_consent']??''));}
 function tipiHubStatus(string $d): array {
     $h=tipiHubConfig($d);
-    return ['mode'=>tipiHubEnabled($h)?'manual':'disconnected','analytics'=>tipiHubEnabled($h),'optimize'=>tipiHubEnabled($h)&&!empty($h['optimize']),'consent'=>'explicit_opt_in','html_contract'=>'data-ta-event / data-ta-revenue / data-ta-meta-*','javascript'=>'Tipi.track(name, meta) delegates to TipiAnalitycs.event','php'=>'Tipi::track(name, meta, stable_reference) queues confirmed public POST events after consent','server_queue_pending'=>count(glob($d.'/hub-outbox/*.json')?:[]),'pairing_ready'=>false,'revenue_provider_ready'=>false];
+    return ['mode'=>!empty($h['access_token'])?'paired':(tipiHubEnabled($h)?'manual':'disconnected'),'analytics'=>tipiHubEnabled($h),'optimize'=>tipiHubEnabled($h)&&!empty($h['optimize']),'consent'=>'explicit_opt_in','html_contract'=>'data-ta-event / data-ta-revenue / data-ta-meta-*','javascript'=>'Tipi.track(name, meta) delegates to TipiAnalitycs.event','php'=>'Tipi::track(name, meta, stable_reference) queues confirmed public POST events after consent','server_queue_pending'=>count(glob($d.'/hub-outbox/*.json')?:[]),'pairing_ready'=>true,'revenue_provider_ready'=>false];
 }
 function tipiHubSettings(string $d,array $post): void {
     $key=trim((string)($post['tracker_key']??''));
@@ -592,6 +650,7 @@ function tipiHubSettings(string $d,array $post): void {
         if(($post['action']??'')==='hub_disconnect'){
             $h['analytics']=false;$h['optimize']=false;$h['tracker_key']='';
         }else{
+            if(!empty($h['access_token'])&&$key!==''&&$key!==($h['tracker_key']??''))fail('La clé est gérée par le Hub',409);
             $h['tracker_key']=$key!==''?$key:($h['tracker_key']??'');
             $h['analytics']=isset($post['analytics']);$h['optimize']=$h['analytics']&&isset($post['optimize']);
             if($h['analytics']&&!tipiHubEnabled($h))fail('Clé de suivi nécessaire');
@@ -605,7 +664,17 @@ function tipiHubSettings(string $d,array $post): void {
 }
 function tipiHubPanel(string $d): string {
     $h=tipiHubConfig($d);$status=tipiHubStatus($d);
-    return '<h1>Le Tipi</h1><div class="panel"><h2>'.(tipiHubEnabled($h)?'Suivi configuré':'Connecter votre site').'</h2><p>Configuration locale provisoire. Récupérez la clé publique du site dans le Tipi Hub. L’association en un clic sera ajoutée côté Hub ultérieurement.</p><form method="post">'.csrf().'<label>Clé publique Analytics (laisser vide pour conserver)<input name="tracker_key" autocomplete="off" placeholder="'.(!empty($h['tracker_key'])?'Clé enregistrée':'Clé du site').'"></label><label><input style="display:inline;width:auto" type="checkbox" name="analytics" '.(!empty($h['analytics'])?'checked':'').'> Activer Analytics sur le site public</label><label><input style="display:inline;width:auto" type="checkbox" name="optimize" '.(!empty($h['optimize'])?'checked':'').'> Activer Optimize après consentement</label><p>Le suivi reste désactivé tant que le visiteur n’a pas accepté. L’administration et les prévisualisations sont exclues.</p><button name="action" value="hub_save">Enregistrer</button><button class="secondary" name="action" value="hub_disconnect">Déconnecter</button></form></div><h2>Événements métier</h2><p>'.(int)$status['server_queue_pending'].' événement(s) PHP en attente. Les clics HTML et événements JS utilisent directement le tracker existant.</p><form method="post">'.csrf().'<button name="action" value="hub_flush" class="secondary">Réessayer les envois PHP</button></form><p><a href="https://le-tipi.club/dashboard">Ouvrir le Tipi Hub</a></p><p>La réception des événements n’est pas confirmée par la simple présence de la clé. Vérifiez le flux temps réel du Hub.</p>';
+    $pairing=$h['pairing']??[];
+    $connect='<div class="panel"><h2>Connexion native au Tipi</h2>';
+    if(!empty($h['access_token'])){
+        $connect.='<p>Site associé au Hub #'.(int)$h['site_id'].'.</p><form method="post">'.csrf().'<button name="action" value="hub_refresh">Vérifier la connexion</button></form>';
+    }elseif(!empty($pairing['public_id'])){
+        $connect.='<p>Code à saisir sur le Hub : <strong>'.e($pairing['pairing_code']).'</strong></p><p><a target="_blank" rel="noopener noreferrer" href="'.TIPI_HUB_ORIGIN.'/plugin/autoriser?pairing='.rawurlencode($pairing['public_id']).'">Autoriser ce site dans le Hub</a></p><form method="post">'.csrf().'<button name="action" value="hub_pair_finish">Terminer la connexion</button><button class="secondary" name="action" value="hub_pair_start">Nouvelle demande</button></form>';
+    }else{
+        $connect.='<p>Associez ce domaine à votre compte Tipi.</p><form method="post">'.csrf().'<button name="action" value="hub_pair_start">Connecter mon site au Tipi</button></form>';
+    }
+    $connect.='</div>';
+    return '<h1>Le Tipi</h1>'.$connect.'<div class="panel"><h2>'.(tipiHubEnabled($h)?'Suivi configuré':'Connecter votre site').'</h2><p>Réglages du suivi. La clé publique est fournie par le Hub lors de l’association ; la configuration manuelle reste possible hors association.</p><form method="post">'.csrf().'<label>Clé publique Analytics (laisser vide pour conserver)<input name="tracker_key" autocomplete="off" placeholder="'.(!empty($h['tracker_key'])?'Clé enregistrée':'Clé du site').'"></label><label><input style="display:inline;width:auto" type="checkbox" name="analytics" '.(!empty($h['analytics'])?'checked':'').'> Activer Analytics sur le site public</label><label><input style="display:inline;width:auto" type="checkbox" name="optimize" '.(!empty($h['optimize'])?'checked':'').'> Activer Optimize après consentement</label><p>Le suivi reste désactivé tant que le visiteur n’a pas accepté. L’administration et les prévisualisations sont exclues.</p><button name="action" value="hub_save">Enregistrer</button><button class="secondary" name="action" value="hub_disconnect">Déconnecter</button></form></div><h2>Événements métier</h2><p>'.(int)$status['server_queue_pending'].' événement(s) PHP en attente. Les clics HTML et événements JS utilisent directement le tracker existant.</p><form method="post">'.csrf().'<button name="action" value="hub_flush" class="secondary">Réessayer les envois PHP</button></form><p><a href="https://le-tipi.club/dashboard">Ouvrir le Tipi Hub</a></p><p>La réception des événements n’est pas confirmée par la simple présence de la clé. Vérifiez le flux temps réel du Hub.</p>';
 }
 function tipiHubRender(string $html,array $cfg): string {
     $h=tipiHubConfig(dataDir());if(!tipiHubEnabled($h))return $html;
@@ -845,8 +914,8 @@ function admin(string $d,array $cfg): void {
             require_once $bridge;
             tipiAdminAction($d,$cfg,$act,$_POST);redirect('/admin?connections=1');
         }
-        if(in_array($act,['hub_save','hub_disconnect','hub_flush'],true)){
-            if($act==='hub_flush')tipiHubFlush($d);else tipiHubSettings($d,$_POST);
+        if(in_array($act,['hub_save','hub_disconnect','hub_flush','hub_pair_start','hub_pair_finish','hub_refresh'],true)){
+            if($act==='hub_flush')tipiHubFlush($d);elseif($act==='hub_save')tipiHubSettings($d,$_POST);else tipiHubPairing($d,$cfg,$act);
             redirect('/admin?hub=1');
         }
         if($act==='design_restore'){
@@ -922,7 +991,7 @@ function admin(string $d,array $cfg): void {
         if(is_file($system.'/bridge.php')&&is_file($system.'/codegraft/standalone/config.php')){
             require_once $system.'/bridge.php';$body.=tipiAdminPanel($d,$cfg);
         }else $body.='<p>Assistant de développement non installé. Voir la procédure de la distribution.</p>';
-        $body.='<details><summary>Connexions techniques avancées</summary><h2>API éditoriale</h2><p>Endpoint : <code>'.e($cfg['url'].'/api/v1').'</code>. Les clés se gèrent dans Contenus.</p><p>Le Tipi : association au Hub à venir.</p></details>';
+        $body.='<details><summary>Connexions techniques avancées</summary><h2>API éditoriale</h2><p>Endpoint : <code>'.e($cfg['url'].'/api/v1').'</code>. Les clés se gèrent dans Contenus.</p><p>Le Tipi : association dans la rubrique Le Tipi.</p></details>';
         shell('Assistant IA',$body,'',$nav);return;
     }
     if(isset($_GET['trash'])){
@@ -953,7 +1022,7 @@ function api(string $d,array $cfg,string $path): never {
     $auth=$_SERVER['HTTP_AUTHORIZATION']??$_SERVER['REDIRECT_HTTP_AUTHORIZATION']??'';
     if(empty($cfg['api_hash'])||!preg_match('~^Bearer ([a-f0-9]{64})$~D',$auth,$m)||!hash_equals($cfg['api_hash'],hash('sha256',$m[1])))jsonout(['error'=>'Non autorisé'],401);
     $method=$_SERVER['REQUEST_METHOD'];
-    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','codegraft_bridge'=>is_file(dirname(__DIR__).'/tipi-system/bridge.php'),'hub'=>false,'hub_tracking'=>tipiHubStatus($d)]);
+    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','codegraft_bridge'=>is_file(dirname(__DIR__).'/tipi-system/bridge.php'),'hub'=>!empty(tipiHubConfig($d)['access_token']),'hub_tracking'=>tipiHubStatus($d)]);
     if($method==='GET'&&$path==='/api/v1/pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
         foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug)),'state_sha256'=>documentState($d,$slug)];
