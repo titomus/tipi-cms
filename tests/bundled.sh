@@ -32,7 +32,7 @@ sleep 1
 BASE=http://localhost:18766
 test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/codegraft/standalone/admin.php")" = 303
 curl -fsS -c "$TMP/cookies" "$BASE/admin" >"$TMP/login"
-CSRF=$(sed -n 's/.*name="csrf" value="\([^"]*\)".*/\1/p' "$TMP/login")
+CSRF=$(sed -n 's/.*name="csrf" value="\([^"]*\)".*/\1/p' "$TMP/login" | head -n 1)
 test -n "$CSRF"
 COOKIE=$(awk '$6 ~ /^tipi_cms_/ {print $6"="$7}' "$TMP/cookies")
 test -n "$COOKIE"
@@ -42,8 +42,9 @@ test -n "$COOKIE"
 curl -fsS -H "Cookie: $COOKIE" "$BASE/admin?connections=1" >"$TMP/panel"
 grep -q 'Assistant IA' "$TMP/panel"
 grep -q 'Création de fonctionnalités' "$TMP/panel"
-CSRF=$(sed -n 's/.*name="csrf" value="\([^"]*\)".*/\1/p' "$TMP/panel")
+CSRF=$(sed -n 's/.*name="csrf" value="\([^"]*\)".*/\1/p' "$TMP/panel" | head -n 1)
 test -n "$CSRF"
+echo "CMS login and assistant panel OK"
 curl -fsS -H "Cookie: $COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=ai_profile' --data-urlencode 'profile=build' --data-urlencode 'accept_php=1' "$BASE/admin" >/dev/null
 php -r '$c=json_decode(file_get_contents(getenv("TIPI_DATA_DIR")."/config.json"),true);if($c["ai_profile"]!=="build")exit(1);'
 # OAuth consent recognizes the CMS session rather than the old CodeGraft session.
@@ -55,6 +56,7 @@ AUTH="$BASE/codegraft-api/oauth/authorize/?response_type=code&client_id=$CLIENT&
 test "$(curl -s -o /dev/null -w '%{http_code}' "$AUTH")" = 403
 curl -fsS -H "Cookie: $COOKIE" "$AUTH" >"$TMP/consent"
 grep -q 'Autoriser' "$TMP/consent"
+echo "OAuth consent page OK"
 for origin in null https://other.example.test; do
   test "$(curl -s -o /dev/null -w '%{http_code}' -H "Origin: $origin" -d 'decision=approve' "$AUTH")" = 403
 done
