@@ -453,14 +453,10 @@ function tipiCodeGraftRoute(string $path,string $data,array $cfg): void {
         http_response_code(403);header('Content-Type: text/plain; charset=utf-8');
         echo 'Tipi CodeGraft : origine de la requête refusée. Ouvrez la page de connexion directement sur le domaine configuré et rechargez-la.';return;
     }
-    if($path==='/codegraft/standalone/admin.php'){
-        if(($_SERVER['REQUEST_METHOD']??'GET')!=='GET'){http_response_code(405);return;}
-        header('Location: /admin?connections=1',true,303);return;
-    }
     require __DIR__.'/codegraft/standalone/bootstrap.php';
     $oauth=new \CodeGraft\OAuthHttp($codegraft['vault']);
     $path=rtrim($path,'/');
-    $routes=['/.well-known/oauth-authorization-server'=>'metadata','/.well-known/oauth-protected-resource'=>'protectedResource','/.well-known/oauth-protected-resource/codegraft-api'=>'protectedResource','/.well-known/oauth-protected-resource/mcp'=>'protectedResource','/mcp/oauth/register'=>'register','/mcp/oauth/authorize'=>'authorize','/mcp/oauth/token'=>'token','/codegraft-api/oauth/register'=>'register','/codegraft-api/oauth/authorize'=>'authorize','/codegraft-api/oauth/token'=>'token'];
+    $routes=['/.well-known/oauth-authorization-server'=>'metadata','/.well-known/oauth-protected-resource'=>'protectedResource','/.well-known/oauth-protected-resource/mcp'=>'protectedResource','/mcp/oauth/register'=>'register','/mcp/oauth/authorize'=>'authorize','/mcp/oauth/token'=>'token'];
     if(isset($routes[$path])){
         $method=$_SERVER['REQUEST_METHOD']??'GET';$action=$routes[$path];
         if(!in_array($method,match($action){'register','token'=>['POST'],'authorize'=>['GET','POST'],default=>['GET']},true)){http_response_code(405);return;}
