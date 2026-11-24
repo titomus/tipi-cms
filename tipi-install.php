@@ -621,7 +621,8 @@ function tipiHubRender(string $html,array $cfg): string {
     }
     $decision=(string)($_COOKIE['tipi_metrics_consent']??'');
     $panel='<aside id="tipi-metrics-consent" style="position:fixed;bottom:12px;right:12px;z-index:2147483647;max-width:min(390px,calc(100vw - 24px));padding:14px;background:#fff;color:#182c23;border:1px solid #bbb;border-radius:8px;font:14px/1.5 system-ui">';
-    if($consented||hash_equals($binding.'.no',$decision))$panel.='<button type="button" data-tipi-consent-choice="reset">Préférences de mesure d’audience</button>';
+    if($consented)$panel.='<button type="button" data-tipi-consent-choice="no">Retirer mon accord de mesure</button>';
+    elseif(hash_equals($binding.'.no',$decision))$panel.='<button type="button" data-tipi-consent-choice="reset">Préférences de mesure d’audience</button>';
     else $panel.='<p>Autorisez-vous la mesure d’audience'.(!empty($h['optimize'])?' et les tests de présentation':'').' ? Le site reste utilisable sans ces mesures.</p><button type="button" data-tipi-consent-choice="yes">Accepter</button><button type="button" data-tipi-consent-choice="no">Refuser</button>';
     $panel.='</aside>';
     // Inject after theme rendering, including custom layouts. The SDK precedes theme scripts.
@@ -952,7 +953,7 @@ function api(string $d,array $cfg,string $path): never {
     $auth=$_SERVER['HTTP_AUTHORIZATION']??$_SERVER['REDIRECT_HTTP_AUTHORIZATION']??'';
     if(empty($cfg['api_hash'])||!preg_match('~^Bearer ([a-f0-9]{64})$~D',$auth,$m)||!hash_equals($cfg['api_hash'],hash('sha256',$m[1])))jsonout(['error'=>'Non autorisé'],401);
     $method=$_SERVER['REQUEST_METHOD'];
-    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','codegraft_bridge'=>is_file(dirname(__DIR__).'/tipi-system/bridge.php'),'hub'=>tipiHubStatus($d)]);
+    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','codegraft_bridge'=>is_file(dirname(__DIR__).'/tipi-system/bridge.php'),'hub'=>false,'hub_tracking'=>tipiHubStatus($d)]);
     if($method==='GET'&&$path==='/api/v1/pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
         foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug)),'state_sha256'=>documentState($d,$slug)];
@@ -1001,7 +1002,7 @@ function mcpCall(string $d,array $cfg,string $name,array $args): array {
         if(!is_string($args['expected_sha256']??null))fail('expected_sha256 requis');
         $expected=$args['expected_sha256'];unset($args['expected_sha256']);return changeDesign($d,$args,$expected);
     }
-    if($name==='cms_site_info')return ['name'=>$cfg['name'],'url'=>$cfg['url'],'version'=>TIPI_VERSION,'storage'=>'markdown','draft_write'=>!empty($cfg['mcp_write']),'publish'=>!empty($cfg['mcp_publish']),'ai_profile'=>$cfg['ai_profile']??'read','design'=>['read'=>true,'write'=>!empty($cfg['mcp_write'])&&!empty($cfg['mcp_publish']),'layouts'=>['classic','wide','centered','editorial'],'custom_css'=>true],'business'=>['read'=>!empty($cfg['business_read']),'write'=>!empty($cfg['business_write']),'development'=>($cfg['ai_profile']??'read')==='build','guide'=>'Utiliser cms_developer_guide : créer des routes, vues, contrôleurs, services, actions MCP, layouts HTML, composants et assets CSS/JS, puis préparer et vérifier un patch avec cg_review_release. Respecter le mode de validation sélectionné.']];
+    if($name==='cms_site_info')return ['name'=>$cfg['name'],'url'=>$cfg['url'],'version'=>TIPI_VERSION,'storage'=>'markdown','tracking'=>tipiHubStatus($d),'draft_write'=>!empty($cfg['mcp_write']),'publish'=>!empty($cfg['mcp_publish']),'ai_profile'=>$cfg['ai_profile']??'read','design'=>['read'=>true,'write'=>!empty($cfg['mcp_write'])&&!empty($cfg['mcp_publish']),'layouts'=>['classic','wide','centered','editorial'],'custom_css'=>true],'business'=>['read'=>!empty($cfg['business_read']),'write'=>!empty($cfg['business_write']),'development'=>($cfg['ai_profile']??'read')==='build','guide'=>'Utiliser cms_developer_guide : créer des routes, vues, contrôleurs, services, actions MCP, layouts HTML, composants et assets CSS/JS, puis préparer et vérifier un patch avec cg_review_release. Respecter le mode de validation sélectionné.']];
     if($name==='cms_list_pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
         foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug)),'state_sha256'=>documentState($d,$slug)];
