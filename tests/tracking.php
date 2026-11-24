@@ -56,6 +56,27 @@ try{
     expect(tipiHubStatus($d)['mode']==='paired','Paired mode');
     expect(tipiHubConfig($d)['tracker_key']===$key,'Automatically obtain tracking key');
     expect(!str_contains(json_encode(tipiHubStatus($d)),$token),'No bearer in public tracking status');
+    // Editorial synchronization uses only published revisions, never the draft.
+    atomic(fileDoc($d,'blog/one','published'),rawDoc('Published title',"A **test** [link](/services).",['id'=>str_repeat('1',24),'seo_title'=>'SEO title','description'=>'Meta description','author'=>'Editor']));
+    atomic(fileDoc($d,'blog/one','drafts'),rawDoc('Private draft','UNPUBLISHED SECRET',['id'=>str_repeat('1',24)]));
+    $syncRequest=function($method,$path,$payload,$headers)use($token){
+        expect($method==='POST'&&$path==='hector/cms/inventory','Hector endpoint');
+        expect($headers===['Authorization: Bearer '.$token],'Scoped bearer');
+        expect($payload['sequence']===1&&count($payload['documents'])===1,'Complete inventory');
+        $doc=$payload['documents'][0];
+        expect($doc['source_uid']===str_repeat('1',24)&&$doc['has_draft']===true,'Stable source UID and draft flag');
+        expect($doc['title']==='Published title'&&$doc['seo_title']==='SEO title'&&$doc['meta_description']==='Meta description','Editorial metadata');
+        expect(str_contains($doc['content_html'],'<strong>test</strong>'),'Rendered HTML for Hector');
+        expect(!str_contains(json_encode($payload),'UNPUBLISHED SECRET'),'No private draft content');
+        return ['inventory'=>['platform'=>'tipi_cms','mode'=>'read_only','sequence'=>1,'count'=>1,'articles'=>1,'synced_at'=>'2026-11-24T12:00:00Z']];
+    };
+    $sync=tipiHectorSync($d,$cfg,$syncRequest);
+    expect($sync['count']===1&&tipiHubStatus($d)['hector_sync']['articles']===1,'Confirmed editorial snapshot');
+    try {
+        tipiHectorSync($d,$cfg,fn()=>fail('Temporary outage',503));
+        throw new LogicException('Expected outage');
+    } catch(RuntimeException $ex){expect($ex->getCode()===503,'Synchronization failure surfaced');}
+    expect(tipiHubStatus($d)['hector_sync']['count']===1&&tipiHubConfig($d)['hector_sequence']===2,'Keep last confirmed state, reserve next sequence');
     tipiHubPairing($d,$cfg,'hub_refresh',$request);
     expect($calls[2][3]===['Authorization: Bearer '.$token],'Authenticated refresh');
     try {
