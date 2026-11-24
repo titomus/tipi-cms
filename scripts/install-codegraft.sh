@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+[[ $# -eq 2 ]] || { echo "Usage: install-codegraft.sh /chemin/tipi_cms https://domaine"; exit 1; }
+ROOT="$(cd "$1" && pwd -P)"
+ORIGIN="$2"
+[[ -f "$ROOT/public/index.php" && ! -L "$ROOT/public/index.php" ]] || { echo "Installation Tipi CMS absente"; exit 1; }
+grep -q "const TIPI_VERSION = '0.8.0-preview'" "$ROOT/public/index.php" || { echo "Mettre à jour Tipi CMS en 0.8 avant CodeGraft"; exit 1; }
+[[ "$ORIGIN" =~ ^https://[a-z0-9][a-z0-9.-]+$ ]] || exit 1
+php -r 'exit(extension_loaded("pdo_sqlite") ? 0 : 1);' || { echo "Activer pdo_sqlite (CLI et Web)"; exit 1; }
+[[ ! -e "$ROOT/tipi-system" && ! -L "$ROOT/tipi-system" && ! -L "$ROOT/app" && ! -L "$ROOT/app/McpActions" ]] || { echo "Système existant : ne pas écraser"; exit 1; }
+umask 077
+php "$HERE/scripts/verify-codegraft.php"
+STAGE="$(mktemp -d "$ROOT/.tipi-system-stage-XXXXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+# Installation locale uniquement : aucun Git, curl, Composer ou accès réseau.
+cp -R "$HERE/bundled/codegraft" "$STAGE/codegraft"
+cp -R "$HERE/bundled/contracts" "$STAGE/contracts"
+test ! -e "$STAGE/codegraft/standalone/config.php"
+cp "$HERE/bundled/manifest.json" "$STAGE/upstream-manifest.json"
+cp "$HERE/integration/bridge.php" "$STAGE/bridge.php"
+printf '%s\n' '<?php require_once __DIR__."/codegraft/bootstrap.php";' >"$STAGE/bootstrap.php"
+find "$STAGE" -type f -name '*.php' -print0 | xargs -0 -n1 php -l >/dev/null
+mkdir -p "$ROOT/app/McpActions"
+VAULT="$HOME/.tipi-cms-codegraft/$(printf '%s' "$ROOT" | sha256sum | cut -c1-24)"
+[[ ! -e "$VAULT" && ! -L "$VAULT" ]] || { echo "Coffre existant, arrêt sans écrasement"; exit 1; }
+mv -T "$STAGE" "$ROOT/tipi-system"
+if ! php "$HERE/integration/init-codegraft.php" "$ROOT" "$VAULT" "$ORIGIN"; then
+  echo "Initialisation incomplète : conserver les fichiers et le coffre pour diagnostic ; aucune donnée du CMS modifiée."
+  exit 1
+fi
+php "$HERE/integration/install-extensions.php" "$ROOT"
+echo "MCP OAuth : $ORIGIN/mcp"
+echo "Administration unique : $ORIGIN/admin?connections=1"
+echo "Approbations métier : $ORIGIN/admin?connections=1"
+echo "Le module exemple Contacts reste inactif tant que le propriétaire ne l'approuve pas."

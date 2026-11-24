@@ -1,0 +1,21 @@
+name: Preview smoke
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: pdo_sqlite
+      - run: find . -name '*.php' -not -path './.git/*' -print0 | xargs -0 -n1 php -l
+      - run: for f in scripts/*.sh tests/*.sh; do bash -n "$f"; done
+      - run: bash tests/smoke.sh
+
+      - run: php scripts/verify-codegraft.php
+      - run: bash tests/bundled.sh
+
+      - run: php -d disable_functions=curl_init tests/tracking.php

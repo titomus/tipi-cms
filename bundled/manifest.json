@@ -1,0 +1,23 @@
+{
+  "source": "titomus/CodeGraft-Framework",
+  "commit": "e128e4bb045df11111729a4b13724976f40b7cdc",
+  "files": {
+    "codegraft/bootstrap.php": "f46e02564fdb2b511d597b87fa43c57f2173a0d8",
+    "codegraft/src/Policy.php": "63c0708232a20d16ca48f8606262436397bcfadf",
+    "codegraft/src/Vault.php": "5c6685ac05653ef45e1c383359947400653bbaae",
+    "codegraft/src/Workspace.php": "0b666d03b796bd232c8d5771055a83bebc9a4482",
+    "codegraft/src/DynamicOAuth.php": "7304ea6ec6f93b3d1ac8954cf1300fde379b198c",
+    "codegraft/src/OAuthHttp.php": "4b730f70d0f3976e7d78c1ae9ef2a94ae84aad92",
+    "codegraft/src/CommandExecutor.php": "31521196cbb3acbd081e530d614c78faa412f222",
+    "codegraft/src/Mcp.php": "361242cef3af63793029f72e4093c83dff6fa3e1",
+    "codegraft/src/Admin.php": "8963a22d7a59511241aa622d8db907706a4b9e3e",
+    "codegraft/src/AuditLog.php": "92e1181ad5f08379060cb4724f261bebae2f07ea",
+    "codegraft/src/ControlCenter.php": "0b3a0fd488f5060b989e26c4f8132d6577bbdae4",
+    "codegraft/standalone/admin.php": "7c52040c0d1b6e39865f94a91c2980c57f0188d0",
+    "codegraft/standalone/bootstrap.php": "dd0e44cc3c4328870184fc3af40a74e425c00347",
+    "contracts/Http.php": "3d1b2440b27a248132a12a2fc77d29a22df64547",
+    "contracts/ActionSchema.php": "76673264a2af2fac367081064cbcca306d858fb7",
+    "contracts/Actions.php": "e0521d7d5345b9ce1c508b27edaca0e99082bb0b",
+    "contracts/Data.php": "01ed3396533e94c1df7a1dcd2117735ebb4528cb"
+  }
+}
