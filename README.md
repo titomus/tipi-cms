@@ -1,4 +1,4 @@
-# Tipi CMS 0.4 preview
+# Tipi CMS 0.5 preview
 
 PHP 8.2+, CMS flat-file inspiré du Mini CMS Oncle Web. Sans BDD, sans Composer sur le serveur. Version de test, pas encore destinée à la production.
 
@@ -57,3 +57,6 @@ Il s'agit d'un prototype sur installation individuelle, pas d'une sandbox. Du PH
 
 ## V0.4 : administration unique
 Pour les installations existantes : `bash scripts/update.sh "$HOME/tipi_cms/public"` met à jour le noyau et l'adaptateur, avec sauvegardes. Ne pas réinstaller CodeGraft. Les anciens identifiants CodeGraft ne sont plus utilisés : l'ancienne URL redirige vers Assistant IA, et OAuth s'appuie sur la session du CMS. Les nouvelles installations de CodeGraft ne demandent aucun mot de passe supplémentaire. Sélectionner Consultation (défaut), Gestion du site, ou Création de fonctionnalités (consentement explicite au risque PHP). Les droits OAuth restent nécessaires. Le développement se limite aux fichiers PHP autonomes app/McpActions ; les commandes et le déploiement direct par MCP sont bloqués. Le design public se modifie via cms_get_design/cms_update_design : palettes, dispositions et CSS personnalisé, historique et restauration dans Apparence. Il n'y a pas encore de système de templates HTML arbitraires ni d'interfaces web métier. Les clés techniques existantes restent distinctes ; les profils pilotent l'accès OAuth. Le Hub reste à connecter.
+
+## V0.5 : extensions web et MCP unifié
+URL canonique OAuth : `/mcp` (sans slash final). Les anciens chemins `/codegraft-api/` restent des alias de routage, mais les jetons OAuth étant liés à leur ressource, reconnectez les clients sur `/mcp`. Les anciennes clés éditoriales Bearer restent utilisables. `scripts/update.sh` met à jour l'adaptateur et la ressource OAuth, conserve une sauvegarde endpoint.json, crée les dossiers d'extension et ajoute l'exemple Contacts sans écraser de fichiers existants. Réenregistrez le profil Création de fonctionnalités pour appliquer les nouveaux dossiers. Activez Contacts dans Assistant IA pour obtenir `/admin/apps/contacts` ; les données sont communes aux actions MCP. Voir `integration/developer-guide.md` (également exposé par `cms_developer_guide`) pour les contrats de routes, vues, services, thèmes HTML, composants et CSS/JS. Les extensions sont approuvées par empreinte ; elles ne constituent pas une sandbox. Les routes restent limitées aux espaces `/apps/` et `/admin/apps/`, les assets sont publics, le noyau et les secrets sont exclus. Les migrations SQL automatiques et une isolation forte restent à développer.
