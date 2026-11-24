@@ -345,7 +345,7 @@ final class MiniMarkdown {
   }
 }
 
-const TIPI_VERSION = '0.4.0-preview';
+const TIPI_VERSION = '0.5.0-preview';
 const TIPI_SETUP_HASH = '';
 const MAX_CONTENT = 262144;
 
@@ -532,11 +532,13 @@ function changeDesign(string $d,array $values,string $expected): array {
         return ['design'=>siteDesign($c),'sha256'=>designHash($c),'revision'=>$rev];
     });
 }
-function shell(string $title,string $body,string $head='',string $nav='',string $brand='Tipi CMS',array $designConfig=[]): void {
+function shell(string $title,string $body,string $head='',string $nav='',string $brand='Tipi CMS',array $designConfig=[],string $template=''): void {
     header('Content-Type: text/html; charset=utf-8');
     $layout=match($designConfig['layout']??'classic'){'wide'=>'header,main,footer{max-width:1200px}','centered'=>'header{justify-content:center;text-align:center}main{max-width:760px}nav{width:100%}','editorial'=>'main{max-width:760px}h1,h2,h3{font-family:Georgia,serif}header{max-width:1100px}',default=>''};
     $extra=$designConfig['custom_css']??'';
     if(!is_string($extra)||preg_match('~[<>]~',$extra))$extra='';
+    $style=strtr(css(),array_combine(['#176044','#244d39','#f7f8f5','#182c23'],design($designConfig))).$layout.$extra;
+    if($designConfig&&function_exists('tipiTheme')){echo tipiTheme(dataDir(),$designConfig,$head,$style,$body,$nav,$brand,$title,$template);return;}
     echo '<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'.e($title).'</title>'.$head.'<style>'.strtr(css(),array_combine(['#176044','#244d39','#f7f8f5','#182c23'],design($designConfig))).$layout.$extra.'</style></head><body><header><strong><a href="/">'.e($brand).'</a></strong><nav>'.$nav.'</nav></header><main>'.$body.'</main><footer>Propulsé par Tipi CMS · Propulsé par Codegraft™</footer></body></html>';
 }
 function navFor(string $d): string {
@@ -545,7 +547,7 @@ function navFor(string $d): string {
     usort($links,fn($a,$b)=>$a['order']<=>$b['order']);
     return implode('',array_map(fn($x)=>'<a href="'.e(pageurl($x['slug'])).'">'.e($x['label']).'</a>',$links));
 }
-function renderBody(string $d,string $body): string {
+function renderBody(string $d,string $body,array $cfg=[]): string {
     // Only whole-line includes and blog lists; no executable PHP or raw HTML.
     $out=''; $buf=[]; $fenced=false;
     $flush=static function()use(&$out,&$buf){if($buf){$out.=MiniMarkdown::toHtml(implode("\n",$buf));$buf=[];}};
@@ -555,6 +557,8 @@ function renderBody(string $d,string $body): string {
             $flush(); $posts=array_filter(inventory($d),fn($m,$k)=>str_starts_with($k,'blog/')&&!noindex($m),ARRAY_FILTER_USE_BOTH);
             uasort($posts,fn($a,$b)=>strcmp($b['published_at']??$b['date']??'',$a['published_at']??$a['date']??''));
             foreach($posts as $slug=>$m) $out.='<article><h2><a href="'.e(pageurl($slug)).'">'.e($m['title']).'</a></h2><p>'.e($m['description']??'').'</p></article>';
+        } elseif (!$fenced && function_exists('tipiMarkdownComponent') && preg_match('~^\s*\{\{component:([A-Za-z0-9_-]+)\}\}\s*$~D',$line,$m)) {
+            $flush();$out.=tipiMarkdownComponent($m[1],$cfg);
         } elseif (!$fenced && preg_match('~^\s*\{\{include:partials/([a-z0-9-]+)\.md\}\}\s*$~D',$line,$m)) {
             $flush(); $p=$d.'/partials/'.$m[1].'.md'; if(is_file($p)&&!is_link($p)) $out.=MiniMarkdown::toHtml((string)file_get_contents($p));
         } else $buf[]=$line;
@@ -570,10 +574,10 @@ function publicPage(string $d,array $cfg,string $slug,bool $preview=false): void
     $schema=['@context'=>'https://schema.org','@type'=>str_starts_with($slug,'blog/')?'Article':'WebPage','name'=>$m['title'],'url'=>$url,'description'=>$desc];
     if(str_starts_with($slug,'blog/')) { $schema['headline']=$m['title']; if(!empty($m['published_at']))$schema['datePublished']=$m['published_at']; if(!empty($m['modified']))$schema['dateModified']=$m['modified']; if(!empty($m['author']))$schema['author']=['@type'=>'Person','name'=>$m['author']]; }
     $head.='<script type="application/ld+json">'.json_encode($schema,JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR).'</script>';
-    $html=renderBody($d,$body);
+    $html=renderBody($d,$body,$preview?[]:$cfg);
     if (!preg_match('~<h1>~i',$html)) $html='<h1>'.e($m['title']).'</h1>'.$html;
     if($preview) $html='<p class="panel">Prévisualisation privée</p>'.$html;
-    shell($title,$html,$head,navFor($d),$cfg['name'],$cfg);
+    shell($title,$html,$head,navFor($d),$cfg['name'],$preview?[]:$cfg,$m['template']??'');
 }
 function setup(string $d): void {
     sessionStart();
@@ -688,6 +692,7 @@ function admin(string $d,array $cfg): void {
         redirect('/admin?edit='.rawurlencode($slug));
     }
     $nav='<a href="/admin">Contenus</a><a href="/admin?settings=1">Apparence</a><a href="/admin?connections=1">Assistant IA</a><a href="/">Voir le site</a><form method="post" action="/admin" style="display:inline">'.csrf().'<button class="secondary" name="action" value="logout">Déconnexion</button></form>';
+    if(function_exists('tipiAppNav'))$nav.=tipiAppNav(dirname(__DIR__),$cfg,true);
     if(isset($_GET['settings'])){
         $choices='';foreach(['forest'=>'Forêt','ink'=>'Encre','sand'=>'Sable'] as $k=>$label)$choices.='<option value="'.$k.'" '.(($cfg['theme']??'forest')===$k?'selected':'').'>'.$label.'</option>';
         $layouts='';foreach(['classic'=>'Classique','wide'=>'Large','centered'=>'Centré','editorial'=>'Éditorial'] as $k=>$label)$layouts.='<option value="'.$k.'" '.(($cfg['layout']??'classic')===$k?'selected':'').'>'.$label.'</option>';
@@ -770,7 +775,7 @@ function mcpCall(string $d,array $cfg,string $name,array $args): array {
         if(!is_string($args['expected_sha256']??null))fail('expected_sha256 requis');
         $expected=$args['expected_sha256'];unset($args['expected_sha256']);return changeDesign($d,$args,$expected);
     }
-    if($name==='cms_site_info')return ['name'=>$cfg['name'],'url'=>$cfg['url'],'version'=>TIPI_VERSION,'storage'=>'markdown','draft_write'=>!empty($cfg['mcp_write']),'publish'=>!empty($cfg['mcp_publish']),'ai_profile'=>$cfg['ai_profile']??'read','design'=>['read'=>true,'write'=>!empty($cfg['mcp_write'])&&!empty($cfg['mcp_publish']),'layouts'=>['classic','wide','centered','editorial'],'custom_css'=>true],'business'=>['read'=>!empty($cfg['business_read']),'write'=>!empty($cfg['business_write']),'development'=>($cfg['ai_profile']??'read')==='build','guide'=>'Créer des actions dans app/McpActions, préparer et valider le patch, demander l’approbation dans Assistant IA, puis utiliser cg_app_catalog et cg_app_invoke.']];
+    if($name==='cms_site_info')return ['name'=>$cfg['name'],'url'=>$cfg['url'],'version'=>TIPI_VERSION,'storage'=>'markdown','draft_write'=>!empty($cfg['mcp_write']),'publish'=>!empty($cfg['mcp_publish']),'ai_profile'=>$cfg['ai_profile']??'read','design'=>['read'=>true,'write'=>!empty($cfg['mcp_write'])&&!empty($cfg['mcp_publish']),'layouts'=>['classic','wide','centered','editorial'],'custom_css'=>true],'business'=>['read'=>!empty($cfg['business_read']),'write'=>!empty($cfg['business_write']),'development'=>($cfg['ai_profile']??'read')==='build','guide'=>'Utiliser cms_developer_guide : créer des routes, vues, contrôleurs, services, actions MCP, layouts HTML, composants et assets CSS/JS, puis préparer un patch à approuver dans Assistant IA.']];
     if($name==='cms_list_pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
         foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug))];
@@ -829,11 +834,22 @@ function main(): void {
     if (!preg_match('~^/[a-zA-Z0-9_./%-]*$~D',$path) || str_contains($path,'//')) fail('URL invalide',400);
     $d=dataDir();$cfg=jread($d.'/config.json');
     if(!$cfg){setup($d);return;}
-    if(in_array($path,['/codegraft-api','/codegraft-api/','/codegraft/standalone/admin.php','/codegraft-api/oauth/register/','/codegraft-api/oauth/authorize/','/codegraft-api/oauth/token/','/.well-known/oauth-authorization-server','/.well-known/oauth-authorization-server/','/.well-known/oauth-protected-resource','/.well-known/oauth-protected-resource/','/.well-known/oauth-protected-resource/codegraft-api','/.well-known/oauth-protected-resource/codegraft-api/'],true)){
+    $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
+    $installed=is_file($bridge)&&!is_link($bridge)&&is_file(dirname(__DIR__).'/tipi-system/codegraft/standalone/config.php');
+    if($installed)require_once $bridge;
+    // Preserve explicitly configured legacy editorial keys without routing OAuth tokens to the legacy handler.
+    if($installed&&in_array($path,['/mcp','/mcp/'],true)){
+        $auth=$_SERVER['HTTP_AUTHORIZATION']??$_SERVER['REDIRECT_HTTP_AUTHORIZATION']??'';
+        if(!empty($cfg['mcp_hash'])&&preg_match('~^Bearer ([a-f0-9]{64})$~D',$auth,$m)&&hash_equals($cfg['mcp_hash'],hash('sha256',$m[1])))mcp($d,$cfg);
+        tipiCodeGraftRoute($path,$d,$cfg);return;
+    }
+    if(in_array($path,['/mcp/oauth/register/','/mcp/oauth/authorize/','/mcp/oauth/token/','/mcp/oauth/register','/mcp/oauth/authorize','/mcp/oauth/token','/.well-known/oauth-protected-resource/mcp','/.well-known/oauth-protected-resource/mcp/','/codegraft-api','/codegraft-api/','/codegraft/standalone/admin.php','/codegraft-api/oauth/register/','/codegraft-api/oauth/authorize/','/codegraft-api/oauth/token/','/.well-known/oauth-authorization-server','/.well-known/oauth-authorization-server/','/.well-known/oauth-protected-resource','/.well-known/oauth-protected-resource/','/.well-known/oauth-protected-resource/codegraft-api','/.well-known/oauth-protected-resource/codegraft-api/'],true)){
         $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
         if(!is_file($bridge)||is_link($bridge)||!is_file(dirname(__DIR__).'/tipi-system/codegraft/standalone/config.php')){http_response_code(404);return;}
         require_once $bridge; tipiCodeGraftRoute($path,$d,$cfg);return;
     }
+    if($installed&&str_starts_with($path,'/assets/')&&tipiAsset($path,$cfg))return;
+    if($installed&&(str_starts_with($path,'/apps/')||str_starts_with($path,'/admin/apps/'))&&tipiAppRoute($path,$d,$cfg))return;
     if(str_starts_with($path,'/tipi-install')){http_response_code(404);return;}
     if($path==='/admin'||$path==='/admin/') {admin($d,$cfg);return;}
     if(str_starts_with($path,'/api/'))api($d,$cfg,$path);
