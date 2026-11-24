@@ -18,7 +18,10 @@ function tipiBusinessManifest(string $root): array {
     return $result;
 }
 final class TipiBusinessContext {
-    public function __construct(private readonly string $directory) {}
+    public function __construct(private readonly string $directory,private readonly string $root='',private readonly array $cfg=[]) {}
+    public function service(string $name): mixed {
+        $f=tipiApprovedFile($this->root,$this->cfg,'app/Services/'.$name.'.php');if(!$f)throw new RuntimeException('Service non approuvé');return require $f;
+    }
     private function path(string $name): string {
         if(!preg_match('~^[a-z][a-z0-9_]{0,39}$~D',$name))throw new RuntimeException('Nom de stockage invalide');
         if(is_link($this->directory)||is_link($this->directory.'/'.$name.'.sqlite'))throw new RuntimeException('Stockage symbolique interdit');
@@ -44,7 +47,7 @@ function tipiRegistry(string $root,string $data,array $cfg): \CGF\ActionRegistry
     if(empty($cfg['business_read']))return $registry;
     $approved=$cfg['business_approved']??[];
     if(!is_array($approved))throw new RuntimeException('Approbations invalides');
-    $context=new TipiBusinessContext($data.'/business');
+    $context=new TipiBusinessContext($data.'/business',$root,$cfg);
     foreach(tipiBusinessManifest($root) as $file=>$hash){
         $source=tipiApprovedFile($root,$cfg,'app/McpActions/'.$file);if(!$source)continue;
         $register=require $source;
@@ -118,11 +121,12 @@ function tipiAppNav(string $root,array $cfg,bool $private): string {
     return $out;
 }
 final class TipiWebContext {
+    private ?\CGF\ActionRegistry $registry=null;
     public function __construct(private readonly string $root,private readonly string $data,private readonly array $cfg,public readonly bool $owner,public readonly string $path,public readonly string $method){}
     public function action(string $name,array $args=[]): array {
         if(!$this->owner)fail('Action métier privée',403);
         $cfg=$this->cfg;$cfg['business_read']=true; // Local owner is independent of remote AI profile.
-        $registry=tipiRegistry($this->root,$this->data,$cfg);
+        $registry=$this->registry??=tipiRegistry($this->root,$this->data,$cfg);
         $a=$registry->all()[$name]??null;
         if(!$a)fail('Action métier non approuvée',404);
         if($a['mode']==='write'&&$this->method!=='POST')fail('Écriture uniquement via POST',405);
@@ -162,7 +166,7 @@ function tipiAppRoute(string $path,string $data,array $cfg): bool {
     if(!is_callable($handler))fail('Contrôleur non conforme',500);
     $html=$handler($ctx,$_GET,$method==='POST'?$_POST:[]);
     if(!is_string($html))fail('Vue non conforme',500);
-    $nav=$r['private']?'<a href="/admin">Contenus</a><a href="/admin?connections=1">Assistant IA</a>'.tipiAppNav($root,$cfg,true):navFor($data).tipiAppNav($root,$cfg,false);
+    $nav=$r['private']?'<a href="/admin">Contenus</a><a href="/admin?connections=1">Assistant IA</a>'.tipiAppNav($root,$cfg,true):navFor($data);
     shell($r['title'],$html,'<meta name="robots" content="noindex">',$nav,$r['private']?'Tipi CMS':$cfg['name'],$r['private']?[]:$cfg);
     return true;
 }
@@ -237,6 +241,18 @@ function tipiAdminAction(string $data,array $cfg,string $action,array $post): vo
             $db->commit();
         }catch(Throwable $ex){$db->rollBack();throw $ex;}return;
     }
+    if($action==='ai_enable_contacts'){
+        if(!password_verify((string)($post['owner_password']??''),$cfg['password_hash'])){usleep(400000);fail('Mot de passe incorrect',403);}
+        $sample=jread(__DIR__.'/contacts-manifest.json');
+        if(count($sample)!==4)fail('Exemple non disponible',409);
+        locked($data,function()use($data,$sample){
+            $c=jread($data.'/config.json');$current=tipiExtensionManifest(dirname(__DIR__));
+            foreach($sample as $p=>$h)if(!isset($current[$p])||!hash_equals($h,$current[$p]))fail('Exemple modifié : approbation manuelle nécessaire',409);
+            foreach($sample as $p=>$h)$c['extension_approved'][$p]=$h;
+            $c['business_read']=true;
+            jwrite($data.'/config.json',$c);
+        });return;
+    }
     if(($cfg['ai_profile']??'read')!=='build')fail('Activez le profil Création de fonctionnalités',403);
     if($action==='ai_approve_module'){
         $file=(string)($post['module']??'');$hash=(string)($post['sha256']??'');
@@ -303,6 +319,7 @@ function tipiAdminPanel(string $data,array $cfg): string {
     }
     if(!$count)$body.='<p>Aucune modification en attente.</p>';
     $body.='<h2>Fonctionnalités de votre site</h2>';
+    if(!isset(tipiRoutes(dirname(__DIR__),$cfg)['/admin/apps/contacts'])&&is_file(__DIR__.'/contacts-manifest.json'))$body.='<div class="panel"><h3>Carnet de contacts</h3><p>Exemple intégré : interface privée et actions MCP sur la même base SQLite.</p><form method="post">'.csrf().field('owner_password','Votre mot de passe','','password').'<button name="action" value="ai_enable_contacts">Activer le carnet de contacts</button></form></div>';
     foreach(tipiExtensionManifest(dirname(__DIR__)) as $file=>$hash){
         $approved=tipiApprovedFile(dirname(__DIR__),$cfg,$file)!==null;
         $body.='<div class="panel"><strong>'.e($file).'</strong><p>'.($approved?'Active':'Version à approuver').'</p>';
