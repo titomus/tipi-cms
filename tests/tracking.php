@@ -57,8 +57,8 @@ try{
     expect(tipiHubConfig($d)['tracker_key']===$key,'Automatically obtain tracking key');
     expect(!str_contains(json_encode(tipiHubStatus($d)),$token),'No bearer in public tracking status');
     // Editorial synchronization uses only published revisions, never the draft.
-    atomic(fileDoc($d,'blog/one','published'),rawDoc('Published title',"A **test** [link](/services).",['id'=>str_repeat('1',24),'seo_title'=>'SEO title','description'=>'Meta description','author'=>'Editor']));
-    atomic(fileDoc($d,'blog/one','drafts'),rawDoc('Private draft','UNPUBLISHED SECRET',['id'=>str_repeat('1',24)]));
+    atomic(legacyDoc($d,'blog/one','published'),rawDoc('Published title',"A **test** [link](/services).",['id'=>str_repeat('1',24),'seo_title'=>'SEO title','description'=>'Meta description','author'=>'Editor']));
+    atomic(legacyDoc($d,'blog/one','drafts'),rawDoc('Private draft','UNPUBLISHED SECRET',['id'=>str_repeat('1',24)]));
     $syncRequest=function($method,$path,$payload,$headers)use($token){
         expect($method==='POST'&&$path==='hector/cms/inventory','Hector endpoint');
         expect($headers===['Authorization: Bearer '.$token],'Scoped bearer');
