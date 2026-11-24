@@ -448,7 +448,10 @@ function saveDoc(string $d,string $slug,string $raw,string $expected,bool $publi
     slugok($slug);
     if (strlen($raw)>MAX_CONTENT || !preg_match('//u',$raw)) fail('Contenu trop volumineux ou UTF-8 invalide');
     [$meta,$body]=front($raw);
-    return locked($d,function()use($d,$slug,$meta,$body,$expected,$publish){
+    return locked($d,fn()=>saveDocLocked($d,$slug,$meta,$body,$expected,$publish));
+}
+// Call only while holding the CMS write lock.
+function saveDocLocked(string $d,string $slug,array $meta,string $body,string $expected,bool $publish): array {
         $current=effective($d,$slug);
         if (!hash_equals(sha($current),$expected)) fail('Conflit de version : rechargez le document',409);
         if ($current!==null) { [$prev]=front($current); $meta['id']=$prev['id']??bin2hex(random_bytes(12)); }
@@ -464,7 +467,6 @@ function saveDoc(string $d,string $slug,string $raw,string $expected,bool $publi
         atomic(fileDoc($d,$slug,$publish?'published':'drafts'),$raw);
         if ($publish && is_file(fileDoc($d,$slug,'drafts'))) unlink(fileDoc($d,$slug,'drafts'));
         return ['slug'=>$slug,'sha256'=>sha($raw),'revision'=>$rev,'status'=>$publish?'published':'draft','url'=>pageurl($slug)];
-    });
 }
 function documentState(string $d,string $slug): string {
     return hash('sha256',json_encode([sha(loadDoc($d,$slug,'published')),sha(loadDoc($d,$slug,'drafts'))],JSON_THROW_ON_ERROR));
@@ -613,7 +615,7 @@ function tipiHubPairing(string $d,array $cfg,string $action,?callable $request=n
             }
             if(($result['platform']??'')!=='tipi_cms'||!preg_match('~^ltcms_[a-f0-9]{48}$~D',(string)($result['access_token']??''))||!preg_match('~^[a-zA-Z0-9_-]{16,128}$~D',(string)($result['tracker_key']??''))||(int)($result['site_id']??0)<=0)fail('Réponse de connexion invalide',502);
             $h['access_token']=$result['access_token'];$h['site_id']=(int)$result['site_id'];$h['tracker_key']=$result['tracker_key'];
-            $h['analytics']=true;$h['optimize']=false;$h['consent_epoch']=bin2hex(random_bytes(12));unset($h['pairing']);
+            $h['analytics']=true;$h['optimize']=false;$h['hector_write']=false;$h['consent_epoch']=bin2hex(random_bytes(12));unset($h['pairing']);
         }elseif($action==='hub_refresh'||$action==='hub_disconnect'){
             if(!empty($h['access_token'])){
                 try{
@@ -630,7 +632,7 @@ function tipiHubPairing(string $d,array $cfg,string $action,?callable $request=n
                 }
             }
             if($action==='hub_disconnect'){
-                unset($h['access_token'],$h['site_id'],$h['pairing'],$h['hector_sync']);$h['tracker_key']='';$h['analytics']=false;$h['optimize']=false;$h['consent_epoch']=bin2hex(random_bytes(12));
+                unset($h['access_token'],$h['site_id'],$h['pairing'],$h['hector_sync'],$h['hector_write']);$h['tracker_key']='';$h['analytics']=false;$h['optimize']=false;$h['consent_epoch']=bin2hex(random_bytes(12));
             }
         }
         jwrite($d.'/hub.json',$h);
@@ -681,6 +683,80 @@ function tipiHectorSync(string $d,array $cfg,?callable $request=null): array {
         return $h['hector_sync'];
     });
 }
+// Explicit local opt-in. Commands are pulled from the fixed Hub origin, never
+// from a member-controlled URL. The only writable surface is editorial Markdown.
+function tipiHectorWriteSettings(string $d,bool $enabled): void {
+    locked($d,function()use($d,$enabled){
+        $h=tipiHubConfig($d);if(empty($h['access_token']))fail('Connectez d’abord le site',409);
+        $h['hector_write']=$enabled;jwrite($d.'/hub.json',$h);
+    });
+}
+function tipiHectorApply(string $d,array $command,string $token): array {
+    return locked($d,function()use($d,$command,$token){
+        $h=tipiHubConfig($d);
+        if(empty($h['hector_write'])||empty($h['access_token'])||!hash_equals($h['access_token'],$token))fail('Écritures Hector désactivées',403);
+        $id=$command['id']??'';$slug=$command['slug']??'';$expected=$command['expected_revision']??null;
+        $mode=$command['mode']??'';$fields=$command['fields']??null;
+        if(!is_string($id)||!preg_match('/^[a-f0-9]{32}$/D',$id)||!is_string($slug)||!is_string($expected)
+            ||($expected!==''&&!preg_match('/^[a-f0-9]{64}$/D',$expected))||!in_array($mode,['draft','publish'],true)
+            ||!is_array($fields)||$fields===[])fail('Commande éditoriale invalide',422);
+        slugok($slug);
+        if($expected===''&&!str_starts_with($slug,'blog/'))fail('Seuls les nouveaux articles sont autorisés',422);
+        $receiptFile=$d.'/hector-receipts/'.$id.'.json';
+        $receipt=jread($receiptFile);
+        if($receipt!==[])return $receipt;
+        $live=loadDoc($d,$slug,'published');$draft=loadDoc($d,$slug,'drafts');
+        // A crash between the atomic document write and receipt persistence is safe.
+        $written=$mode==='publish'?$live:$draft;
+        if($written!==null && (front($written)[0]['hector_operation']??'')===$id){
+            $receipt=['id'=>$id,'status'=>'applied','revision'=>sha($written),'mode'=>$mode];
+            jwrite($receiptFile,$receipt);return $receipt;
+        }
+        if($draft!==null||!hash_equals(sha($live),$expected))fail('Un brouillon ou une version plus récente existe',409);
+        [$meta,$body]=$live!==null?front($live):[['title'=>'','description'=>'','date'=>gmdate('Y-m-d')],''];
+        if(str_contains($body,'{{'))fail('Document dynamique protégé',409);
+        $map=['title'=>'title','seo_title'=>'seo_title','meta_description'=>'description','author_name'=>'author','category_name'=>'category'];
+        foreach($fields as $key=>$value){
+            if(!is_string($value)||!preg_match('//u',$value))fail('Champ éditorial invalide',422);
+            if($key==='content_markdown'){
+                if(strlen($value)>MAX_CONTENT||str_contains($value,'{{'))fail('Markdown dynamique ou trop volumineux',422);
+                $body=$value;
+            }elseif(isset($map[$key])){
+                if(strlen($value)>2000||preg_match('/[\r\n\x00]/',$value))fail('Métadonnée invalide',422);
+                $meta[$map[$key]]=$value;
+            }else fail('Champ interdit',422);
+        }
+        if(trim($meta['title'])===''||($live===null&&trim($body)===''))fail('Titre et contenu requis',422);
+        $meta['hector_operation']=$id;
+        $raw=encodeDoc($meta,$body);
+        if(strlen($raw)>MAX_CONTENT)fail('Contenu trop volumineux',422);
+        $result=saveDocLocked($d,$slug,$meta,$body,$expected,$mode==='publish');
+        $receipt=['id'=>$id,'status'=>'applied','revision'=>$result['sha256'],'mode'=>$mode];
+        jwrite($receiptFile,$receipt);return $receipt;
+    });
+}
+function tipiHectorRun(string $d,array $cfg,?callable $request=null): array {
+    $request=$request??'tipiHubRequest';$h=tipiHubConfig($d);
+    if(empty($h['access_token']))fail('Connectez d’abord le site',409);
+    // Sync every run, even if editorial writes are disabled.
+    $sync=tipiHectorSync($d,$cfg,$request);
+    if(empty($h['hector_write']))return ['inventory'=>$sync,'command'=>null];
+    $token=$h['access_token'];$headers=['Authorization: Bearer '.$token];
+    $context=['site_url'=>$cfg['url'],'installation_uid'=>$h['installation_uid']];
+    $command=$request('POST','hector/cms/commands',$context,$headers)['commands']['command']??null;
+    if($command===null)return ['inventory'=>$sync,'command'=>null];
+    if(!is_array($command))fail('Commande Hector invalide',502);
+    try{$receipt=tipiHectorApply($d,$command,$token);}
+    catch(RuntimeException $ex){
+        if(!in_array($ex->getCode(),[409,422],true))throw $ex;
+        $receipt=['id'=>$command['id']??'','status'=>'rejected','reason'=>$ex->getCode()===409?'conflict':'invalid'];
+    }
+    // Confirm the new published snapshot before acknowledging success.
+    if($receipt['status']==='applied')$sync=tipiHectorSync($d,$cfg,$request);
+    $ack=$request('POST','hector/cms/commands',$context+['receipt'=>$receipt],$headers)['commands']??[];
+    if(($ack['acknowledged']??null)!==$receipt['id'])fail('Accusé de réception Hector manquant',502);
+    return ['inventory'=>$sync,'command'=>$receipt];
+}
 function tipiHubEnabled(array $h): bool {return ($h['analytics']??false)===true&&is_string($h['tracker_key']??null)&&preg_match('~^[a-zA-Z0-9_-]{16,128}$~D',$h['tracker_key'])===1;}
 function tipiHubBinding(array $h): string {return substr(hash('sha256',($h['installation_uid']??'').'|'.($h['consent_epoch']??'').'|'.($h['tracker_key']??'').'|'.(!empty($h['optimize'])?'1':'0')),0,32);}
 function tipiHubConsent(array $h): bool {return tipiHubEnabled($h)&&hash_equals(tipiHubBinding($h).'.yes',(string)($_COOKIE['tipi_metrics_consent']??''));}
@@ -716,7 +792,8 @@ function tipiHubPanel(string $d): string {
     if(!empty($h['access_token'])){
         $sync=$h['hector_sync']??[];
         $connect.='<p>Site associé au Hub #'.(int)$h['site_id'].'.</p><form method="post">'.csrf().'<button name="action" value="hub_refresh">Vérifier la connexion</button></form>';
-        $connect.='<h3>Hector : synchronisation éditoriale (lecture seule)</h3><p>'.(!empty($sync['synced_at'])?(int)$sync['count'].' document(s), dont '.(int)$sync['articles'].' article(s), synchronisés le '.e($sync['synced_at']):'Aucun inventaire transmis à Hector.').'</p><form method="post">'.csrf().'<button name="action" value="hector_sync">Synchroniser les contenus avec Hector</button></form>';
+        $connect.='<h3>Hector : synchronisation éditoriale</h3><p>'.(!empty($sync['synced_at'])?(int)$sync['count'].' document(s), dont '.(int)$sync['articles'].' article(s), synchronisés le '.e($sync['synced_at']):'Aucun inventaire transmis à Hector.').'</p><form method="post">'.csrf().'<button name="action" value="hector_sync">Synchroniser les contenus avec Hector</button></form>';
+        $connect.='<form method="post">'.csrf().'<label><input type="checkbox" name="hector_write" '.(!empty($h['hector_write'])?'checked':'').'> Autoriser Hector à créer des articles et modifier les contenus éditoriaux (brouillons ou publications)</label><button name="action" value="hector_write_save">Enregistrer les droits Hector</button></form><form method="post">'.csrf().'<button name="action" value="hector_run">Synchroniser et traiter une commande Hector</button></form>';
     }elseif(!empty($pairing['public_id'])){
         $connect.='<p>Code à saisir sur le Hub : <strong>'.e($pairing['pairing_code']).'</strong></p><p><a target="_blank" rel="noopener noreferrer" href="'.TIPI_HUB_ORIGIN.'/plugin/autoriser?pairing='.rawurlencode($pairing['public_id']).'">Autoriser ce site dans le Hub</a></p><form method="post">'.csrf().'<button name="action" value="hub_pair_finish">Terminer la connexion</button><button class="secondary" name="action" value="hub_pair_start">Nouvelle demande</button></form>';
     }else{
@@ -963,6 +1040,8 @@ function admin(string $d,array $cfg): void {
             require_once $bridge;
             tipiAdminAction($d,$cfg,$act,$_POST);redirect('/admin?connections=1');
         }
+        if($act==='hector_write_save'){tipiHectorWriteSettings($d,isset($_POST['hector_write']));redirect('/admin?hub=1');}
+        if($act==='hector_run'){tipiHectorRun($d,$cfg);redirect('/admin?hub=1');}
         if($act==='hector_sync'){tipiHectorSync($d,$cfg);redirect('/admin?hub=1');}
         if(in_array($act,['hub_save','hub_disconnect','hub_flush','hub_pair_start','hub_pair_finish','hub_refresh'],true)){
             if($act==='hub_flush')tipiHubFlush($d);elseif($act==='hub_save')tipiHubSettings($d,$_POST);else tipiHubPairing($d,$cfg,$act);
@@ -1224,6 +1303,11 @@ function main(): void {
 }
 if (PHP_SAPI === 'cli' && defined('TIPI_LIBRARY_ONLY') && TIPI_LIBRARY_ONLY===true) return;
 if (PHP_SAPI === 'cli') {
+    if(($argv[1]??'')==='--tipi-run-hector'){
+        try{$d=dataDir();$cfg=jread($d.'/config.json');if(!$cfg)fail('CMS non installé',409);
+            echo json_encode(tipiHectorRun($d,$cfg),JSON_THROW_ON_ERROR).PHP_EOL;exit;
+        }catch(Throwable $ex){fwrite(STDERR,"Traitement Hector non confirmé : ".$ex->getMessage().PHP_EOL);exit(1);}
+    }
     if(($argv[1]??'')==='--tipi-sync-hector'){
         try{
             $d=dataDir();$cfg=jread($d.'/config.json');
