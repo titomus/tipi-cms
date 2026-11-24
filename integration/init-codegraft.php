@@ -14,7 +14,7 @@ if(is_file($cg['vault']->directory.'/admin.json'))throw new RuntimeException('Co
 $cg['vault']->put('admin.json',['password_hash'=>password_hash($password,PASSWORD_BCRYPT),'created_at'=>gmdate('c')]);
 $policy=$cg['vault']->policy();$policy['read_dirs']=['app/McpActions'];$policy['write_dirs']=[];
 $cg['vault']->savePolicy($policy);
-$cg['vault']->put('endpoint.json',['path'=>'/codegraft-api/','oauth_issuer'=>$url,'oauth_resource'=>$url.'/codegraft-api/','oauth_admin_path'=>'/admin?connections=1','created_at'=>gmdate('c')]);
+$cg['vault']->put('endpoint.json',['path'=>'/mcp/','oauth_issuer'=>$url,'oauth_resource'=>$url.'/mcp','oauth_admin_path'=>'/admin?connections=1','created_at'=>gmdate('c')]);
 $path=$sys.'/codegraft/standalone/config.php';
 $php="<?php\nreturn ".var_export(['root'=>$root,'vault'=>$cg['vault']->directory,'adapter'=>'generic'],true).";\n";
 $handle=fopen($path,'x');if(!$handle)throw new RuntimeException('Configuration impossible');
