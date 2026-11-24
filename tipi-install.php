@@ -843,7 +843,7 @@ function main(): void {
         if(!empty($cfg['mcp_hash'])&&preg_match('~^Bearer ([a-f0-9]{64})$~D',$auth,$m)&&hash_equals($cfg['mcp_hash'],hash('sha256',$m[1])))mcp($d,$cfg);
         tipiCodeGraftRoute($path,$d,$cfg);return;
     }
-    if(in_array($path,['/mcp/oauth/register/','/mcp/oauth/authorize/','/mcp/oauth/token/','/mcp/oauth/register','/mcp/oauth/authorize','/mcp/oauth/token','/.well-known/oauth-protected-resource/mcp','/.well-known/oauth-protected-resource/mcp/','/codegraft-api','/codegraft-api/','/codegraft/standalone/admin.php','/codegraft-api/oauth/register/','/codegraft-api/oauth/authorize/','/codegraft-api/oauth/token/','/.well-known/oauth-authorization-server','/.well-known/oauth-authorization-server/','/.well-known/oauth-protected-resource','/.well-known/oauth-protected-resource/','/.well-known/oauth-protected-resource/codegraft-api','/.well-known/oauth-protected-resource/codegraft-api/'],true)){
+    if(in_array($path,['/mcp/oauth/register/','/mcp/oauth/authorize/','/mcp/oauth/token/','/mcp/oauth/register','/mcp/oauth/authorize','/mcp/oauth/token','/.well-known/oauth-protected-resource/mcp','/.well-known/oauth-protected-resource/mcp/','/.well-known/oauth-authorization-server','/.well-known/oauth-authorization-server/','/.well-known/oauth-protected-resource','/.well-known/oauth-protected-resource/'],true)){
         $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
         if(!is_file($bridge)||is_link($bridge)||!is_file(dirname(__DIR__).'/tipi-system/codegraft/standalone/config.php')){http_response_code(404);return;}
         require_once $bridge; tipiCodeGraftRoute($path,$d,$cfg);return;
@@ -855,7 +855,7 @@ function main(): void {
     if(str_starts_with($path,'/api/'))api($d,$cfg,$path);
     if($path==='/mcp'||$path==='/mcp/')mcp($d,$cfg);
     if(!in_array($_SERVER['REQUEST_METHOD'],['GET','HEAD'],true)){http_response_code(405);return;}
-    if($path==='/robots.txt'){header('Content-Type: text/plain; charset=utf-8');echo "User-agent: *\nDisallow: /admin\nDisallow: /api/\nDisallow: /mcp\nDisallow: /codegraft\nDisallow: /codegraft-api/\nSitemap: ".$cfg['url']."/sitemap.xml\n";return;}
+    if($path==='/robots.txt'){header('Content-Type: text/plain; charset=utf-8');echo "User-agent: *\nDisallow: /admin\nDisallow: /api/\nDisallow: /mcp\nSitemap: ".$cfg['url']."/sitemap.xml\n";return;}
     if($path==='/sitemap.xml'){header('Content-Type: application/xml; charset=utf-8');echo '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">';foreach(inventory($d)as $slug=>$m)if(!noindex($m)){echo '<url><loc>'.e($cfg['url'].pageurl($slug)).'</loc>';if(!empty($m['modified'])&&strtotime($m['modified'])!==false)echo '<lastmod>'.gmdate('Y-m-d',strtotime($m['modified'])).'</lastmod>';echo '</url>';}echo '</urlset>';return;}
     if($path==='/home'){header('Location: /',true,301);return;}
     if($path!=='/'&&str_ends_with($path,'/')&&preg_match('~^/(?:blog/)?[a-z0-9][a-z0-9-]{0,99}/$~D',$path)){header('Location: '.rtrim($path,'/'),true,301);return;}
