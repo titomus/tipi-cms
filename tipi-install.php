@@ -3,7 +3,7 @@ declare(strict_types=1);
 
 // Tiny Markdown subset (safe by default: no HTML passthrough)
 // Supports: # ## ###, - lists, > quotes, **bold**, *italic*, _italic_, `code`, ```fences```, [text](url), ![alt](url), pipe tables
-// Note: raw HTML can be injected via cms.php using {{{ ... }}} blocks (restored after parsing).
+// Tipi CMS preview: raw HTML and executable shortcodes are intentionally disabled.
 final class MiniMarkdown {
   public static function toHtml($md){
     $md = (string)$md;
@@ -376,14 +376,14 @@ function jread(string $path): array {
 function jwrite(string $path, array $data): void { atomic($path, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)); }
 function dataDir(): string {
     $override = getenv('TIPI_DATA_DIR');
-    $home = getenv('HOME') ?: dirname(__DIR__);
+    $home = getenv('HOME') ?: (getenv('USERPROFILE') ?: dirname(__DIR__));
     $path = $override ?: rtrim($home, '/\\').'/.tipi-cms/'.substr(hash('sha256', __DIR__), 0, 20);
     if (!str_starts_with($path, '/') && !preg_match('~^[A-Za-z]:[\\\\/]~', $path)) fail('TIPI_DATA_DIR doit être absolu', 500);
     if (is_link($path)) fail('Stockage symbolique interdit', 500);
     $probe = $path;
     while (!file_exists($probe) && dirname($probe) !== $probe) $probe = dirname($probe);
     $real = realpath($probe);
-    $root = realpath($_SERVER['DOCUMENT_ROOT'] ?: __DIR__) ?: __DIR__;
+    $root = realpath(($_SERVER['DOCUMENT_ROOT'] ?? '') ?: __DIR__) ?: __DIR__;
     $norm = static fn($v) => rtrim(str_replace('\\', '/', $v), '/').'/';
     if ($real === false || str_starts_with(strtolower($norm($real)), strtolower($norm($root)))) fail('Stockage privé hors racine web obligatoire', 500);
     if (preg_match('~(?:^|[/\\\\])\.\.(?:[/\\\\]|$)~', $path)) fail('Chemin de stockage invalide', 500);
@@ -564,9 +564,21 @@ function setup(string $d): void {
             foreach($seed as $slug=>$raw){[$m,$b]=front($raw);$m['id']=bin2hex(random_bytes(12));$m['published_at']=gmdate(DATE_ATOM);atomic(fileDoc($d,$slug,'published'),encodeDoc($m,$b));}
             $source=(string)file_get_contents(__FILE__);
             $source=preg_replace("~const TIPI_SETUP_HASH = '[a-f0-9]*';~","const TIPI_SETUP_HASH = '';",$source,1);
-            if(basename(__FILE__)!=='index.php')atomic(__DIR__.'/index.php',$source);
-            atomic(__DIR__.'/.htaccess',"Options -Indexes\nDirectoryIndex index.php\nRewriteEngine On\nRewriteRule ^index\.php$ - [L]\nRewriteRule ^tipi-install[^/]*\.php$ - [F,L]\nRewriteRule ^ index.php [L,QSA]\n");
+            $createdIndex=false; $createdHtaccess=false;
+            try {
+            if(basename(__FILE__)!=='index.php') {
+                if(file_exists(__DIR__.'/index.php')) fail('index.php existe déjà',409);
+                atomic(__DIR__.'/index.php',$source); $createdIndex=true; chmod(__DIR__.'/index.php',0644);
+            }
+            if(file_exists(__DIR__.'/.htaccess')) fail('.htaccess existe déjà',409);
+            atomic(__DIR__.'/.htaccess',"Options -Indexes\nDirectoryIndex index.php\nRewriteEngine On\nRewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]\nRewriteRule ^index\.php$ - [L]\nRewriteRule ^tipi-install[^/]*\.php$ - [F,L]\nRewriteRule ^ index.php [L,QSA]\n");
+            $createdHtaccess=true; chmod(__DIR__.'/.htaccess',0644);
             jwrite($d.'/config.json',['name'=>$name,'url'=>$url,'password_hash'=>password_hash($pw,PASSWORD_DEFAULT),'api_hash'=>'','api_publish'=>false,'version'=>TIPI_VERSION]);
+            } catch(Throwable $error) {
+                if($createdHtaccess) @unlink(__DIR__.'/.htaccess');
+                if($createdIndex) @unlink(__DIR__.'/index.php');
+                throw $error;
+            }
         });
         if(basename(__FILE__)!=='index.php') @unlink(__FILE__);
         redirect('/admin');
@@ -619,7 +631,7 @@ function admin(string $d,array $cfg): void {
     shell('Administration',$body,'',$nav);
 }
 function api(string $d,array $cfg,string $path): never {
-    $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
+    $auth=$_SERVER['HTTP_AUTHORIZATION']??$_SERVER['REDIRECT_HTTP_AUTHORIZATION']??'';
     if(empty($cfg['api_hash'])||!preg_match('~^Bearer ([a-f0-9]{64})$~D',$auth,$m)||!hash_equals($cfg['api_hash'],hash('sha256',$m[1])))jsonout(['error'=>'Non autorisé'],401);
     $method=$_SERVER['REQUEST_METHOD'];
     if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>false,'hub'=>false]);
@@ -644,7 +656,10 @@ function api(string $d,array $cfg,string $path): never {
 function main(): void {
     header('X-Content-Type-Options: nosniff'); header('Referrer-Policy: strict-origin-when-cross-origin'); header('X-Frame-Options: DENY');
     header("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https:; frame-src https://www.youtube-nocookie.com; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
-    $path=(string)(parse_url($_SERVER['REQUEST_URI']??'/',PHP_URL_PATH)??'/');
+    $request=(string)($_SERVER['REQUEST_URI']??'/');
+    if (!str_starts_with($request,'/') || str_starts_with($request,'//')) fail('URL invalide',400);
+    $path=explode('?', $request, 2)[0];
+    if (!preg_match('~^/[a-zA-Z0-9_./%-]*$~D',$path) || str_contains($path,'//')) fail('URL invalide',400);
     $d=dataDir();$cfg=jread($d.'/config.json');
     if(!$cfg){setup($d);return;}
     if(str_starts_with($path,'/tipi-install')){http_response_code(404);return;}
@@ -654,7 +669,7 @@ function main(): void {
     if($path==='/robots.txt'){header('Content-Type: text/plain; charset=utf-8');echo "User-agent: *\nDisallow: /admin\nDisallow: /api/\nSitemap: ".$cfg['url']."/sitemap.xml\n";return;}
     if($path==='/sitemap.xml'){header('Content-Type: application/xml; charset=utf-8');echo '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">';foreach(inventory($d)as $slug=>$m)if(!noindex($m)){echo '<url><loc>'.e($cfg['url'].pageurl($slug)).'</loc>';if(!empty($m['modified'])&&strtotime($m['modified'])!==false)echo '<lastmod>'.gmdate('Y-m-d',strtotime($m['modified'])).'</lastmod>';echo '</url>';}echo '</urlset>';return;}
     if($path==='/home'){header('Location: /',true,301);return;}
-    if($path!=='/'&&str_ends_with($path,'/')){header('Location: '.rtrim($path,'/'),true,301);return;}
+    if($path!=='/'&&str_ends_with($path,'/')&&preg_match('~^/(?:blog/)?[a-z0-9][a-z0-9-]{0,99}/$~D',$path)){header('Location: '.rtrim($path,'/'),true,301);return;}
     $slug=$path==='/'?'home':ltrim($path,'/');
     if(!preg_match('~^(?:blog/)?[a-z0-9][a-z0-9-]{0,99}$~D',$slug)||in_array($slug,['admin','api','assets','robots','sitemap','404'],true)){http_response_code(404);shell('Page introuvable','<h1>Page introuvable</h1>','<meta name="robots" content="noindex">');return;}
     publicPage($d,$cfg,$slug);
