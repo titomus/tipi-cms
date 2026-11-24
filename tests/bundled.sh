@@ -3,7 +3,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 PID=''
-trap 'if [[ -n "$PID" ]]; then kill "$PID" 2>/dev/null || true; fi; rm -rf "$TMP"' EXIT
+trap 'rc=$?; if [[ $rc -ne 0 && -f "$TMP/admin-server.log" ]]; then cat "$TMP/admin-server.log"; fi; if [[ -n "$PID" ]]; then kill "$PID" 2>/dev/null || true; fi; rm -rf "$TMP"' EXIT
 export HOME="$TMP/home"
 mkdir -p "$HOME" "$TMP/site/public" "$TMP/no-network"
 cp "$HERE/tipi-install.php" "$TMP/site/public/index.php"
@@ -29,18 +29,22 @@ require getenv('TIPI_TEST_ROOT').'/public/index.php';
 PHP
 php -S 127.0.0.1:18766 "$TMP/router.php" >"$TMP/admin-server.log" 2>&1 & PID=$!
 sleep 1
-BASE=http://127.0.0.1:18766
+BASE=http://localhost:18766
 test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/codegraft/standalone/admin.php")" = 303
 curl -fsS -c "$TMP/cookies" "$BASE/admin" >"$TMP/login"
 CSRF=$(sed -n 's/.*name="csrf" value="\([^"]*\)".*/\1/p' "$TMP/login")
 test -n "$CSRF"
-curl -fsS -b "$TMP/cookies" -c "$TMP/cookies" --data-urlencode "csrf=$CSRF" --data-urlencode 'password=cms-password-123456' "$BASE/admin" >/dev/null
-curl -fsS -b "$TMP/cookies" "$BASE/admin?connections=1" >"$TMP/panel"
+COOKIE=$(awk '$6 ~ /^tipi_cms_/ {print $6"="$7}' "$TMP/cookies")
+test -n "$COOKIE"
+curl -fsS -H "Cookie: $COOKIE" -c "$TMP/cookies" --data-urlencode "csrf=$CSRF" --data-urlencode 'password=cms-password-123456' "$BASE/admin" >/dev/null
+COOKIE=$(awk '$6 ~ /^tipi_cms_/ {print $6"="$7}' "$TMP/cookies")
+test -n "$COOKIE"
+curl -fsS -H "Cookie: $COOKIE" "$BASE/admin?connections=1" >"$TMP/panel"
 grep -q 'Assistant IA' "$TMP/panel"
 grep -q 'Création de fonctionnalités' "$TMP/panel"
 CSRF=$(sed -n 's/.*name="csrf" value="\([^"]*\)".*/\1/p' "$TMP/panel")
 test -n "$CSRF"
-curl -fsS -b "$TMP/cookies" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=ai_profile' --data-urlencode 'profile=build' --data-urlencode 'accept_php=1' "$BASE/admin" >/dev/null
+curl -fsS -H "Cookie: $COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=ai_profile' --data-urlencode 'profile=build' --data-urlencode 'accept_php=1' "$BASE/admin" >/dev/null
 php -r '$c=json_decode(file_get_contents(getenv("TIPI_DATA_DIR")."/config.json"),true);if($c["ai_profile"]!=="build")exit(1);'
 # OAuth consent recognizes the CMS session rather than the old CodeGraft session.
 curl -fsS -H 'Content-Type: application/json' -d '{"redirect_uris":["https://chatgpt.com/connector_platform_oauth_redirect"]}' "$BASE/codegraft-api/oauth/register/" >"$TMP/client"
@@ -49,7 +53,7 @@ test -n "$CLIENT"
 CHALLENGE=$(php -r 'echo rtrim(strtr(base64_encode(hash("sha256",str_repeat("a",43),true)),"+/","-_"),"=");')
 AUTH="$BASE/codegraft-api/oauth/authorize/?response_type=code&client_id=$CLIENT&redirect_uri=https%3A%2F%2Fchatgpt.com%2Fconnector_platform_oauth_redirect&code_challenge=$CHALLENGE&code_challenge_method=S256&scope=app%3Aread%20app%3Awrite%20codegraft%3Aread%20codegraft%3Awrite&state=test"
 test "$(curl -s -o /dev/null -w '%{http_code}' "$AUTH")" = 403
-curl -fsS -b "$TMP/cookies" "$AUTH" >"$TMP/consent"
+curl -fsS -H "Cookie: $COOKIE" "$AUTH" >"$TMP/consent"
 grep -q 'Autoriser' "$TMP/consent"
 for origin in null https://other.example.test; do
   test "$(curl -s -o /dev/null -w '%{http_code}' -H "Origin: $origin" -d 'decision=approve' "$AUTH")" = 403
