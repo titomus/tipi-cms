@@ -38,4 +38,20 @@ curl -fsS -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application
 test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/test-draft")" = 404
 test "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d "$BODY" "$BASE/api/v1/pages/test-draft")" = 409
 test "$(curl -s -o /dev/null -w '%{http_code}' -X PUT -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' -d '{"raw":"---\ntitle: New\n---\nText","expected_sha256":"","publish":true}' "$BASE/api/v1/pages/test-live")" = 403
+test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN" "$BASE/mcp")" = 401
+curl -fsS -b "$COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=mcp_rotate' "$BASE/admin" >"$ROOT/mcp-token"
+MCP=$(sed -n 's/.*<pre>\([a-f0-9]\{64\}\)<\/pre>.*/\1/p' "$ROOT/mcp-token")
+test -n "$MCP"
+rpc(){ curl -fsS -H "Authorization: Bearer $MCP" -H 'Content-Type: application/json' -d "$1" "$BASE/mcp"; }
+rpc '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}' | grep -q '"protocolVersion":"2025-11-25"'
+rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | grep -q 'cms_save_draft'
+rpc '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"cms_save_draft","arguments":{"slug":"mcp-test","raw":"---\ntitle: MCP test\n---\nDraft","expected_sha256":""}}}' | grep -q '"isError":true'
+curl -fsS -b "$COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=mcp_policy' --data-urlencode 'mcp_write=1' "$BASE/admin" >/dev/null
+rpc '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"cms_save_draft","arguments":{"slug":"mcp-test","raw":"---\ntitle: MCP test\n---\nDraft","expected_sha256":""}}}' | grep -q 'revision'
+test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/mcp-test")" = 404
+rpc '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"cms_publish","arguments":{"slug":"mcp-publish","raw":"---\ntitle: MCP test\n---\nDraft","expected_sha256":""}}}' | grep -q '"isError":true'
+curl -fsS -b "$COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=settings' --data-urlencode 'name=New name' --data-urlencode 'theme=ink' --data-urlencode 'accent=#123456' "$BASE/admin" >/dev/null
+curl -fsS "$BASE/" | grep -q '#123456'
+curl -fsS -b "$COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=mcp_revoke' "$BASE/admin" >/dev/null
+test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $MCP" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' "$BASE/mcp")" = 401
 echo 'Smoke test OK'

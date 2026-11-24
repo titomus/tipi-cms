@@ -1,4 +1,4 @@
-# Tipi CMS 0.1 preview
+# Tipi CMS 0.2 preview
 
 PHP 8.2+, CMS flat-file inspiré du Mini CMS Oncle Web. Sans BDD, sans Composer sur le serveur. Version de test, pas encore destinée à la production.
 
@@ -33,4 +33,10 @@ API avec Authorization: Bearer <clé> :
 SEO : HTML serveur, title, description, canonical, robots, sitemap, JSON-LD, Open Graph, 404. Le rendu est dynamique ; aucun benchmark ni cache HTML statique dans cette version.
 
 ## Limites
-Le Hub, Hector et CodeGraft MCP ne sont pas encore connectés. L'API éditoriale ne prétend pas être MCP. Le noyau reste une preview ; tests de déploiement mutualisé, sécurité avancée, médias, thèmes personnalisables, cache statique, redirections et intégration CodeGraft à réaliser. Ne pas réutiliser l'ancien mcp.php d'Oncle Web. Ne pas copier les données d'Oncle Web. Sauvegarder le dossier privé.
+Le Hub, Hector et CodeGraft de développement ne sont pas encore connectés. Le MCP éditorial natif est indépendant de CodeGraft ; il utilise une clé Bearer, sans OAuth ni connexion ChatGPT certifiée. Le noyau reste une preview ; tests de déploiement mutualisé, sécurité avancée, médias, thèmes personnalisables, cache statique, redirections et intégration CodeGraft à réaliser. Ne pas réutiliser l'ancien mcp.php d'Oncle Web. Ne pas copier les données d'Oncle Web. Sauvegarder le dossier privé.
+
+## Mise à jour 0.1 → 0.2
+Depuis le clone, lancez les tests puis `bash scripts/update.sh /chemin/absolu/public`. Le script remplace seulement index.php, conserve une copie hors racine publique et ne touche pas au stockage Markdown ni à .htaccess. Ne relancez pas l'installateur. Gardez le même document root et les mêmes variables d'environnement.
+
+## Administration 0.2
+Apparence : trois palettes et couleur personnalisée. Connexions : clé MCP indépendante, lecture seule au départ, écriture de brouillons et publication activables séparément, révocation. Aucun accès au système de fichiers ou PHP. Le serveur /mcp implémente une partie de Streamable HTTP JSON, négociation 2025-11-25 et 2025-06-18, sans SSE, sans OAuth. Pour un client acceptant Authorization: Bearer, envoyez initialize puis tools/list et tools/call. Les outils disponibles : cms_site_info, cms_list_pages, cms_read_page, cms_save_draft, cms_publish. OAuth, protocole 2026-07-28, CodeGraft et Hub restent à intégrer. Ne pas publier une clé dans un chat ou URL.
