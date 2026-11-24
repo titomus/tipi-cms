@@ -128,6 +128,12 @@ try{
     expect($category['description']==='Updated','Category update');
     try{tipiEditorialCategorySave($d,'direct',['name'=>'Other','expected_revision'=>$category['revision']],$token);throw new LogicException('Expected assigned rename refusal');}
     catch(RuntimeException $ex){expect($ex->getCode()===409,'Assigned category name protected');}
+    $draftCommand=['id'=>str_repeat('6',32),'slug'=>'blog/direct-draft','expected_revision'=>'','mode'=>'draft','fields'=>['title'=>'Draft','content_html'=>'<p>Draft content</p>']];
+    $draftResult=tipiHectorApply($d,$draftCommand,$token,true);
+    $draftCommand['id']=str_repeat('5',32);$draftCommand['expected_revision']=$draftResult['revision'];$draftCommand['fields']=['title'=>'New draft title'];
+    $draftResult=tipiHectorApply($d,$draftCommand,$token,true);
+    $draftCommand['id']=str_repeat('4',32);$draftCommand['expected_revision']=$draftResult['revision'];$draftCommand['mode']='publish';
+    expect(tipiHectorApply($d,$draftCommand,$token,true)['mode']==='publish'&&loadDoc($d,'blog/direct-draft','drafts')===null,'Owned draft can be updated and published');
     // Exercise polling, full inventory refresh and acknowledgement recovery.
     $queued=array_replace($new,['id'=>str_repeat('9',32),'slug'=>'blog/poll']);
     $ackAttempts=0;$polls=0;
