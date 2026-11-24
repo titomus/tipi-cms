@@ -30,7 +30,8 @@ PHP
 php -S 127.0.0.1:18766 "$TMP/router.php" >"$TMP/admin-server.log" 2>&1 & PID=$!
 sleep 1
 BASE=http://localhost:18766
-test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/codegraft/standalone/admin.php")" = 303
+test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/codegraft/standalone/admin.php")" = 404
+ test "$(curl -s -o /dev/null -w '%{http_code}' "$BASE/codegraft-api/")" = 404
 curl -fsS -c "$TMP/cookies" "$BASE/admin" >"$TMP/login"
 CSRF=$(sed -n 's/.*name="csrf" value="\([^"]*\)".*/\1/p' "$TMP/login" | head -n 1)
 test -n "$CSRF"
