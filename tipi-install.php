@@ -630,10 +630,47 @@ function tipiHubPairing(string $d,array $cfg,string $action,?callable $request=n
                 }
             }
             if($action==='hub_disconnect'){
-                unset($h['access_token'],$h['site_id'],$h['pairing']);$h['tracker_key']='';$h['analytics']=false;$h['optimize']=false;$h['consent_epoch']=bin2hex(random_bytes(12));
+                unset($h['access_token'],$h['site_id'],$h['pairing'],$h['hector_sync']);$h['tracker_key']='';$h['analytics']=false;$h['optimize']=false;$h['consent_epoch']=bin2hex(random_bytes(12));
             }
         }
         jwrite($d.'/hub.json',$h);
+    });
+}
+// Complete, bounded inventory of published source documents; drafts are never transmitted.
+function tipiHectorDocuments(string $d): array {
+    $docs=[];$ids=[];
+    foreach(['','blog/'] as $sub)foreach(glob($d.'/published/'.$sub.'*.md')?:[] as $file){
+        $slug=slugok($sub.basename($file,'.md'));
+        $raw=loadDoc($d,$slug,'published');
+        if($raw===null||strlen($raw)>MAX_CONTENT)fail('Inventaire éditorial incomplet',409);
+        [$meta,$body]=front($raw);$uid=$meta['id']??'';
+        if(!preg_match('/^[a-f0-9]{24}$/D',$uid)||isset($ids[$uid]))fail('Identité de document manquante ou dupliquée : '.$slug,409);
+        $ids[$uid]=true;
+        $docs[]=['source_uid'=>$uid,'slug'=>$slug,'title'=>$meta['title'],'seo_title'=>$meta['seo_title']??'',
+            'meta_description'=>$meta['description']??'','modified'=>$meta['modified']??$meta['published_at']??'',
+            'author_name'=>$meta['author']??'','category_name'=>$meta['category']??'','revision'=>sha($raw),
+            'content_markdown'=>$body,'content_html'=>MiniMarkdown::toHtml($body),
+            'has_draft'=>loadDoc($d,$slug,'drafts')!==null,'dynamic'=>str_contains($body,'{{')];
+        if(count($docs)>200)fail('Inventaire supérieur à 200 documents : synchronisation par lots nécessaire',413);
+    }
+    usort($docs,static fn($a,$b)=>strcmp($a['slug'],$b['slug']));
+    return $docs;
+}
+function tipiHectorSync(string $d,array $cfg,?callable $request=null): array {
+    $request=$request??'tipiHubRequest';
+    return locked($d,function()use($d,$cfg,$request){
+        $h=tipiHubConfig($d);
+        if(empty($h['access_token'])||empty($h['installation_uid']))fail('Connectez d’abord votre site au Tipi',409);
+        $sequence=(int)($h['hector_sequence']??0)+1;
+        $payload=['site_url'=>$cfg['url'],'installation_uid'=>$h['installation_uid'],'sequence'=>$sequence,'documents'=>tipiHectorDocuments($d)];
+        if(strlen(json_encode($payload,JSON_THROW_ON_ERROR))>750000)fail('Inventaire trop volumineux : synchronisation par lots nécessaire',413);
+        // Reserve the sequence before sending. A lost response cannot replay an older snapshot.
+        $h['hector_sequence']=$sequence;jwrite($d.'/hub.json',$h);
+        $result=$request('POST','hector/cms/inventory',$payload,['Authorization: Bearer '.$h['access_token']])['inventory']??[];
+        if(($result['platform']??'')!=='tipi_cms'||($result['mode']??'')!=='read_only'||(int)($result['sequence']??0)!==$sequence||(int)($result['count']??-1)!==count($payload['documents']))fail('Hector n’a pas confirmé l’inventaire complet',502);
+        $h['hector_sync']=['count'=>(int)$result['count'],'articles'=>(int)($result['articles']??0),'synced_at'=>(string)($result['synced_at']??gmdate(DATE_ATOM))];
+        jwrite($d.'/hub.json',$h);
+        return $h['hector_sync'];
     });
 }
 function tipiHubEnabled(array $h): bool {return ($h['analytics']??false)===true&&is_string($h['tracker_key']??null)&&preg_match('~^[a-zA-Z0-9_-]{16,128}$~D',$h['tracker_key'])===1;}
@@ -641,7 +678,7 @@ function tipiHubBinding(array $h): string {return substr(hash('sha256',($h['inst
 function tipiHubConsent(array $h): bool {return tipiHubEnabled($h)&&hash_equals(tipiHubBinding($h).'.yes',(string)($_COOKIE['tipi_metrics_consent']??''));}
 function tipiHubStatus(string $d): array {
     $h=tipiHubConfig($d);
-    return ['mode'=>!empty($h['access_token'])?'paired':(tipiHubEnabled($h)?'manual':'disconnected'),'analytics'=>tipiHubEnabled($h),'optimize'=>tipiHubEnabled($h)&&!empty($h['optimize']),'consent'=>'explicit_opt_in','html_contract'=>'data-ta-event / data-ta-revenue / data-ta-meta-*','javascript'=>'Tipi.track(name, meta) delegates to TipiAnalitycs.event','php'=>'Tipi::track(name, meta, stable_reference) queues confirmed public POST events after consent','server_queue_pending'=>count(glob($d.'/hub-outbox/*.json')?:[]),'pairing_ready'=>true,'revenue_provider_ready'=>false];
+    return ['mode'=>!empty($h['access_token'])?'paired':(tipiHubEnabled($h)?'manual':'disconnected'),'analytics'=>tipiHubEnabled($h),'optimize'=>tipiHubEnabled($h)&&!empty($h['optimize']),'consent'=>'explicit_opt_in','html_contract'=>'data-ta-event / data-ta-revenue / data-ta-meta-*','javascript'=>'Tipi.track(name, meta) delegates to TipiAnalitycs.event','php'=>'Tipi::track(name, meta, stable_reference) queues confirmed public POST events after consent','server_queue_pending'=>count(glob($d.'/hub-outbox/*.json')?:[]),'pairing_ready'=>true,'hector_sync'=>$h['hector_sync']??null,'revenue_provider_ready'=>false];
 }
 function tipiHubSettings(string $d,array $post): void {
     $key=trim((string)($post['tracker_key']??''));
@@ -669,7 +706,9 @@ function tipiHubPanel(string $d): string {
     $pairing=$h['pairing']??[];
     $connect='<div class="panel"><h2>Connexion native au Tipi</h2>';
     if(!empty($h['access_token'])){
+        $sync=$h['hector_sync']??[];
         $connect.='<p>Site associé au Hub #'.(int)$h['site_id'].'.</p><form method="post">'.csrf().'<button name="action" value="hub_refresh">Vérifier la connexion</button></form>';
+        $connect.='<h3>Hector : synchronisation éditoriale (lecture seule)</h3><p>'.(!empty($sync['synced_at'])?(int)$sync['count'].' document(s), dont '.(int)$sync['articles'].' article(s), synchronisés le '.e($sync['synced_at']):'Aucun inventaire transmis à Hector.').'</p><form method="post">'.csrf().'<button name="action" value="hector_sync">Synchroniser les contenus avec Hector</button></form>';
     }elseif(!empty($pairing['public_id'])){
         $connect.='<p>Code à saisir sur le Hub : <strong>'.e($pairing['pairing_code']).'</strong></p><p><a target="_blank" rel="noopener noreferrer" href="'.TIPI_HUB_ORIGIN.'/plugin/autoriser?pairing='.rawurlencode($pairing['public_id']).'">Autoriser ce site dans le Hub</a></p><form method="post">'.csrf().'<button name="action" value="hub_pair_finish">Terminer la connexion</button><button class="secondary" name="action" value="hub_pair_start">Nouvelle demande</button></form>';
     }else{
@@ -916,6 +955,7 @@ function admin(string $d,array $cfg): void {
             require_once $bridge;
             tipiAdminAction($d,$cfg,$act,$_POST);redirect('/admin?connections=1');
         }
+        if($act==='hector_sync'){tipiHectorSync($d,$cfg);redirect('/admin?hub=1');}
         if(in_array($act,['hub_save','hub_disconnect','hub_flush','hub_pair_start','hub_pair_finish','hub_refresh'],true)){
             if($act==='hub_flush')tipiHubFlush($d);elseif($act==='hub_save')tipiHubSettings($d,$_POST);else tipiHubPairing($d,$cfg,$act);
             redirect('/admin?hub=1');
