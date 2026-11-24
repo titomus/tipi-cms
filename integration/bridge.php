@@ -88,7 +88,7 @@ function tipiAdminAction(string $data,array $cfg,string $action,array $post): vo
         locked($data,function()use($data,$profile,$vault){
             $c=jread($data.'/config.json');
             $vault->locked(fn()=>$vault->savePolicy(tipiAiPolicy($profile)));
-            $c['ai_profile']=$profile;$c['mcp_write']=$profile!=='read';$c['mcp_publish']=$profile!=='read';
+            $c['ai_profile']=$profile;
             $c['business_read']=true;$c['business_write']=$profile!=='read';
             jwrite($data.'/config.json',$c);
         });return;
@@ -199,8 +199,10 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
     $canWrite=tipiScope($principal,\CodeGraft\DynamicOAuth::APP_WRITE);
     $cgRead=tipiScope($principal,\CodeGraft\DynamicOAuth::READ);
     $profile=$cfg['ai_profile']??'read';
-    if($profile==='read'){$cfg['mcp_write']=false;$cfg['mcp_publish']=false;$cfg['business_write']=false;}
+    $cfg['mcp_write']=$cfg['mcp_publish']=$profile!=='read'&&$canRead&&$canWrite;
+    if($profile==='read')$cfg['business_write']=false;
     $cgWrite=tipiScope($principal,\CodeGraft\DynamicOAuth::WRITE);
+    $cfg['oauth_development']=$profile==='build'&&$cgRead&&$cgWrite;
     $devDefs=array_values(array_filter(\CodeGraft\Mcp::definitions(),static fn($t)=>in_array($t['name'],['cg_capabilities','cg_list_files','cg_search','cg_project_map','cg_read_files','cg_prepare_patch','cg_prepare_diff','cg_validate_patch','cg_history'],true)));
     if($method==='tools/list'){
         $defs=($cgRead||$cgWrite)&&($cfg['ai_profile']??'read')==='build'?$devDefs:[];
@@ -209,6 +211,7 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
             try{$defs=array_merge($defs,tipiRegistry($root,$data,$cfg)->definitions());}
             catch(Throwable $ex){error_log('Tipi business registry unavailable: '.get_class($ex));}
         }
+        if(!$canRead)$defs=array_merge($defs,array_values(array_filter(mcpTools(),fn($t)=>$t['name']==='cms_site_info')));
         return tipiRpc($id,['tools'=>$defs]);
     }
     if($method!=='tools/call'||!is_string($p['name']??null)||!is_array($p['arguments']??[]))return tipiRpcError($id,-32602,'Invalid tool call');
@@ -234,9 +237,19 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
         }catch(Throwable $ex){error_log('Tipi business action refused: '.get_class($ex));return tipiToolError($id,$ex instanceof \CGF\HttpError?$ex->getMessage():'Action métier indisponible');}
     }
     if(str_starts_with($name,'cms_')){
+        if($name==='cms_site_info'){
+            $info=mcpCall($data,$cfg,$name,[]);
+            $info['oauth_scopes']=$principal['scopes']??[];
+            $info['editorial_read']=$canRead;
+            $info['business']['read']=$canRead&&!empty($cfg['business_read']);
+            $info['business']['write']=$canRead&&$canWrite&&!empty($cfg['business_write']);
+            $info['business']['development']=$cfg['oauth_development'];
+            $info['design']['read']=$canRead;
+            return tipiToolResult($id,$info);
+        }
         if(!$canRead)return tipiToolError($id,'Scope app:read requis');
         if(in_array($name,['cms_save_draft','cms_publish','cms_update_design'],true)&&!$canWrite)return tipiToolError($id,'Scope app:write requis');
-        // OAuth uses the same separate editorial write/publication switches as native MCP.
+        // OAuth permissions are derived from the live profile and consented scopes, independently of legacy Bearer keys.
         try{return tipiToolResult($id,mcpCall($data,$cfg,$name,$args));}
         catch(Throwable $ex){return tipiToolError($id,$ex instanceof RuntimeException&&$ex->getCode()<500?$ex->getMessage():'Action éditoriale indisponible');}
     }
@@ -245,7 +258,7 @@ function tipiBridgeDispatch(array $request,array $principal,array $system,string
     $policy=$system['vault']->policy();
     foreach(array_merge($policy['read_dirs']??[],$policy['write_dirs']??[]) as $dir)
         if(!is_string($dir)||!preg_match('~^app/McpActions(?:/[A-Za-z0-9_-]+)*$~D',$dir))
-            return tipiToolError($id,'Limiter les dossiers CodeGraft à app/McpActions dans son administration.');
+            return tipiToolError($id,'Réenregistrez le profil Création de fonctionnalités dans Assistant IA.');
     return $system['mcp']->dispatch($request,$principal);
 }
 function tipiCodeGraftRoute(string $path,string $data,array $cfg): void {
@@ -276,6 +289,10 @@ function tipiCodeGraftRoute(string $path,string $data,array $cfg): void {
             // Only the CMS login is authoritative; old standalone cookies are ignored.
             $_SESSION['cg_authenticated']=!empty($_SESSION['admin']);
             $_SESSION['cg_csrf']=$_SESSION['csrf'];
+            // Default scopes for clients that omit scope; never broaden an explicit request.
+            if($method==='GET'&&!isset($_GET['scope'])){
+                $_GET['scope']=match($cfg['ai_profile']??'read'){'build'=>'app:read app:write codegraft:read codegraft:write','manage'=>'app:read app:write',default=>'app:read'};
+            }
             // OAuth uses the same browser session, including CSRF consent.
             header('Referrer-Policy: same-origin');
         }
