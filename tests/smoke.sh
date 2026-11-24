@@ -57,4 +57,25 @@ curl -fsS -b "$COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode "expected=
 curl -fsS "$BASE/" | grep -q '#123456'
 curl -fsS -b "$COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=mcp_revoke' "$BASE/admin" >/dev/null
 test "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $MCP" -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"ping"}' "$BASE/mcp")" = 401
+# Tracking enabled only by owner configuration, with public consent and no tracking in admin.
+curl -fsS "$BASE/" >"$ROOT/no-tracking"
+if grep -q 'tipi-metrics.js' "$ROOT/no-tracking"; then exit 1; fi
+curl -fsS -b "$COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=hub_save' --data-urlencode 'tracker_key=local-test-key-not-live-123456' --data-urlencode 'analytics=1' --data-urlencode 'optimize=1' "$BASE/admin" >/dev/null
+curl -fsS "$BASE/" >"$ROOT/optin"
+grep -q 'tipi-metrics.js' "$ROOT/optin"
+grep -q 'data-tipi-consent-choice="no"' "$ROOT/optin"
+if grep -q 'analitycs.le-tipi.club/tracker.js' "$ROOT/optin"; then exit 1; fi
+BIND=$(php -r '$h=json_decode(file_get_contents(getenv("TIPI_DATA_DIR")."/hub.json"),true);echo substr(hash("sha256",$h["installation_uid"]."|".$h["consent_epoch"]."|".$h["tracker_key"]."|1"),0,32);')
+curl -fsS -D "$ROOT/tracking-headers" -H "Cookie: tipi_metrics_consent=$BIND.yes" "$BASE/" >"$ROOT/tracking"
+test "$(grep -o 'analitycs.le-tipi.club/tracker.js' "$ROOT/tracking" | wc -l)" = 1
+test "$(grep -o 'optimize.le-tipi.club/optimize.js' "$ROOT/tracking" | wc -l)" = 1
+grep -qi 'connect-src.*https://analitycs.le-tipi.club' "$ROOT/tracking-headers"
+curl -fsS -b "$COOKIE" -b "tipi_metrics_consent=$BIND.yes" "$BASE/admin?hub=1" >"$ROOT/admin-hub"
+if grep -q 'analitycs.le-tipi.club/tracker.js' "$ROOT/admin-hub"; then exit 1; fi
+curl -fsS -H "Cookie: tipi_metrics_consent=$BIND.no" "$BASE/" >"$ROOT/refused"
+if grep -q 'analitycs.le-tipi.club/tracker.js' "$ROOT/refused"; then exit 1; fi
+curl -fsS "$BASE/tipi-metrics.js" | grep -q 'window.Tipi.track'
+curl -fsS -b "$COOKIE" --data-urlencode "csrf=$CSRF" --data-urlencode 'action=hub_disconnect' "$BASE/admin" >/dev/null
+curl -fsS -H "Cookie: tipi_metrics_consent=$BIND.yes" "$BASE/" >"$ROOT/disconnected"
+if grep -q 'tipi-metrics.js' "$ROOT/disconnected"; then exit 1; fi
 echo 'Smoke test OK'
