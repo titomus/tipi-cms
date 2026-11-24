@@ -1,0 +1,678 @@
+<?php
+declare(strict_types=1);
+
+// Tiny Markdown subset (safe by default: no HTML passthrough)
+// Supports: # ## ###, - lists, > quotes, **bold**, *italic*, _italic_, `code`, ```fences```, [text](url), ![alt](url), pipe tables
+// Note: raw HTML can be injected via cms.php using {{{ ... }}} blocks (restored after parsing).
+final class MiniMarkdown {
+  public static function toHtml($md){
+    $md = (string)$md;
+    $md = str_replace(array("\r\n","\r"), "\n", $md);
+    $lines = explode("\n", $md);
+
+    $html = '';
+    $listType = null; // 'ul' ou 'ol'
+    $inCode = false;
+    $codeLang = '';
+
+    $n = count($lines);
+    for ($i = 0; $i < $n; $i++) {
+      $line = $lines[$i];
+
+      // Fenced code blocks
+      if (preg_match('~^```\s*([a-z0-9_-]+)?\s*$~i', $line, $m)) {
+        if (!$inCode) {
+          $inCode = true;
+          $codeLang = isset($m[1]) ? strtolower($m[1]) : '';
+          if ($listType) { $html .= "</{$listType}>"; $listType = null; }
+          $html .= '<pre class="code"><code'.($codeLang?(' data-lang="'.htmlspecialchars($codeLang, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8').'"'):'').'>';
+        } else {
+          $inCode = false;
+          $html .= "</code></pre>";
+        }
+        continue;
+      }
+
+      if ($inCode) {
+        $html .= htmlspecialchars($line, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . "\n";
+        continue;
+      }
+
+      $trim = trim($line);
+
+      // Empty line closes list
+      if ($trim === '') {
+        if ($listType) { $html .= "</{$listType}>"; $listType = null; }
+        continue;
+      }
+
+      // --- TABLES (pipe tables) ---
+      // Detect a table header row + separator row, then consume contiguous rows
+      if (self::looksLikeTableRow($trim) && ($i + 1 < $n) && self::isTableSeparator(trim($lines[$i + 1]))) {
+        if ($listType) { $html .= "</{$listType}>"; $listType = null; }
+
+        $headerLine = $trim;
+        $sepLine = trim($lines[$i + 1]);
+        $aligns = self::parseTableAlignments($sepLine);
+
+        $headers = self::splitTableRow($headerLine);
+        $rows = [];
+
+        // consume header + separator
+        $i += 2;
+
+        // consume body rows while they look like table rows and not blank
+        for (; $i < $n; $i++) {
+          $rowTrim = trim($lines[$i]);
+          if ($rowTrim === '') { $i--; break; } // let outer loop handle blank
+          if (!self::looksLikeTableRow($rowTrim)) { $i--; break; }
+          $rows[] = self::splitTableRow($rowTrim);
+        }
+
+        $html .= self::renderTable($headers, $rows, $aligns);
+        continue;
+      }
+
+      // Headings
+      if (preg_match('~^(#{1,6})\s+(.+)$~', $trim, $m)) {
+        if ($listType) { $html .= "</{$listType}>"; $listType = null; }
+        $lvl = strlen($m[1]);
+        $html .= "<h{$lvl}>" . self::inline($m[2]) . "</h{$lvl}>";
+        continue;
+      }
+
+      // Lists (ordered then unordered)
+
+      // Ordered list: "1. item"
+      if (preg_match('~^\d+\.\s+(.+)$~', $trim, $m)) {
+        if ($listType !== 'ol') {
+          if ($listType) { $html .= "</{$listType}>"; }
+          $html .= "<ol>";
+          $listType = 'ol';
+        }
+        $html .= '<li>' . self::inline($m[1]) . '</li>';
+        continue;
+      }
+
+      // Unordered list: "- item" or "* item"
+      if (preg_match('~^[-*]\s+(.+)$~', $trim, $m)) {
+        if ($listType !== 'ul') {
+          if ($listType) { $html .= "</{$listType}>"; }
+          $html .= "<ul>";
+          $listType = 'ul';
+        }
+        $html .= '<li>' . self::inline($m[1]) . '</li>';
+        continue;
+      }
+
+      // Blockquotes
+      if (preg_match('~^>\s?(.+)$~', $trim, $m)) {
+        if ($listType) { $html .= "</{$listType}>"; $listType = null; }
+        $html .= '<blockquote>' . self::inline($m[1]) . '</blockquote>';
+        continue;
+      }
+
+      // ✅ YouTube embed (standalone line) AVANT le paragraphe
+      $ytId = self::extractYouTubeId($trim);
+      if ($ytId) {
+        if ($listType) { $html .= "</{$listType}>"; $listType = null; }
+        $html .= self::renderYouTubeEmbed($ytId);
+        continue;
+      }
+
+      // ✅ YouTube embed (token explicite) AVANT le paragraphe
+      if (preg_match('~^\{\{youtube:([a-zA-Z0-9_-]{6,})\}\}$~', $trim, $m)) {
+        if ($listType) { $html .= "</{$listType}>"; $listType = null; }
+        $html .= self::renderYouTubeEmbed($m[1]);
+        continue;
+      }
+
+      // hr
+      if (preg_match('~^---+$~', $trim)) {
+        if ($listType) { $html .= "</{$listType}>"; $listType = null; }
+        $html .= '<hr>';
+        continue;
+      }
+
+      // Paragraph
+      if ($listType) { $html .= "</{$listType}>"; $listType = null; }
+      $html .= '<p>' . self::inline($trim) . '</p>';
+    }
+
+    if ($listType) $html .= "</{$listType}>";
+    if ($inCode) $html .= "</code></pre>";
+
+    return $html;
+  }
+
+  private static function sanitizeUrl($url){
+    $url = trim((string)$url);
+    if ($url === '' || preg_match('~[\x00-\x20\x7f\\\\]~', $url)) return '#';
+    if (str_starts_with($url, '//')) return '#';
+    if ($url[0] === '/' || $url[0] === '#') return $url;
+    if (preg_match('~^https?://~i', $url) && filter_var($url, FILTER_VALIDATE_URL)) return $url;
+    return '#';
+  }
+
+  private static function inline($s){
+    $s = (string)$s;
+    $esc = static fn($v) => htmlspecialchars($v, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $plain = static fn($v) => self::applyEmphasisOutsideTags($esc($v));
+    $pattern = '~\x60([^\x60]+)\x60|(!?)\[([^\]\r\n]*)\]\(([^)\r\n]+)\)~';
+    preg_match_all($pattern, $s, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE | PREG_UNMATCHED_AS_NULL);
+    $out = ''; $offset = 0;
+    foreach ($matches as $m) {
+      $start = $m[0][1];
+      $out .= $plain(substr($s, $offset, $start - $offset));
+      if ($m[1][0] !== null) {
+        $out .= '<code>'.$esc($m[1][0]).'</code>';
+      } else {
+        $url = self::sanitizeUrl($m[4][0]);
+        $label = $esc($m[3][0]);
+        if ($m[2][0] === '!') {
+          $out .= $url === '#' ? $label : '<img src="'.$esc($url).'" alt="'.$label.'" loading="lazy" decoding="async">';
+        } else {
+          $out .= '<a href="'.$esc($url).'">'.$label.'</a>';
+        }
+      }
+      $offset = $start + strlen($m[0][0]);
+    }
+    return $out.$plain(substr($s, $offset));
+  }
+
+  private static function applyEmphasisOutsideTags($s){
+  $parts = preg_split('~(<[^>]+>)~', $s, -1, PREG_SPLIT_DELIM_CAPTURE);
+  if (!$parts) return $s;
+
+  for ($i = 0; $i < count($parts); $i++) {
+    if ($parts[$i] === '' || $parts[$i][0] === '<') continue;
+
+    $t = $parts[$i];
+
+    // Bold first
+    $t = preg_replace('~\*\*([^*]+)\*\*~', '<strong>$1</strong>', $t);
+
+    // Italic with asterisks
+    $t = preg_replace('~\*([^*]+)\*~', '<em>$1</em>', $t);
+
+    // Italic with underscores
+    $t = preg_replace('~(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)~', '<em>$1</em>', $t);
+
+    // Small text with ²...²
+    $t = preg_replace('~\x{00B2}(.+?)\x{00B2}~u', '<small>$1</small>', $t);
+
+    $parts[$i] = $t;
+  }
+
+  return implode('', $parts);
+}
+
+  // ---------- TABLE HELPERS ----------
+
+  private static function looksLikeTableRow($line){
+    // Needs at least one pipe and some non-pipe content
+    if (strpos($line, '|') === false) return false;
+    $tmp = trim($line);
+    // ignore cases where it's basically just pipes
+    return (bool)preg_match('~[^\s|]~', $tmp);
+  }
+
+  private static function isTableSeparator($line){
+    // Accept forms like:
+    // | --- | ---: | :---: |
+    // ---|---|---
+    if (strpos($line, '|') === false) return false;
+    $cells = self::splitTableRow($line);
+    if (count($cells) < 1) return false;
+
+    foreach ($cells as $c) {
+      $c = trim($c);
+      if ($c === '') return false;
+      // allow :---, ---:, :---:
+      if (!preg_match('~^:?-{3,}:?$~', $c)) return false;
+    }
+    return true;
+  }
+
+  private static function splitTableRow($line){
+    // Trim outer pipes then split
+    $line = trim($line);
+    $line = preg_replace('~^\|~', '', $line);
+    $line = preg_replace('~\|$~', '', $line);
+    $cells = array_map('trim', explode('|', $line));
+    return $cells;
+  }
+
+  private static function parseTableAlignments($sepLine){
+    $cells = self::splitTableRow($sepLine);
+    $aligns = [];
+    foreach ($cells as $c) {
+      $c = trim($c);
+      $left = str_starts_with($c, ':');
+      $right = str_ends_with($c, ':');
+      if ($left && $right) $aligns[] = 'center';
+      else if ($right) $aligns[] = 'right';
+      else if ($left) $aligns[] = 'left';
+      else $aligns[] = ''; // default
+    }
+    return $aligns;
+  }
+
+  private static function renderTable($headers, $rows, $aligns){
+    $colCount = max(count($headers), count($aligns));
+    foreach ($rows as $r) $colCount = max($colCount, count($r));
+
+    $out = '<div class="md-table-wrap"><table class="md-table">';
+
+    // THEAD
+    $out .= '<thead><tr>';
+    for ($i = 0; $i < $colCount; $i++) {
+      $txt = $headers[$i] ?? '';
+      $al = $aligns[$i] ?? '';
+      $style = $al ? ' style="text-align:'.$al.'"' : '';
+      $out .= '<th'.$style.'>'.self::inline($txt).'</th>';
+    }
+    $out .= '</tr></thead>';
+
+    // TBODY
+    if (!empty($rows)) {
+      $out .= '<tbody>';
+      foreach ($rows as $r) {
+        $out .= '<tr>';
+        for ($i = 0; $i < $colCount; $i++) {
+          $txt = $r[$i] ?? '';
+          $al = $aligns[$i] ?? '';
+          $style = $al ? ' style="text-align:'.$al.'"' : '';
+          $out .= '<td'.$style.'>'.self::inline($txt).'</td>';
+        }
+        $out .= '</tr>';
+      }
+      $out .= '</tbody>';
+    }
+
+    $out .= '</table></div>';
+    return $out;
+  }
+
+  /**
+   * YouTube embed support: detect standalone YouTube URLs and convert to embeds, and also support explicit {{youtube:ID}} tokens.
+   */
+  private static function extractYouTubeId($s){
+    $s = trim((string)$s);
+
+    // Only transform if the whole line looks like a YouTube URL (avoid surprise embeds inside paragraphs)
+    if (!preg_match('~^https?://~i', $s)) return null;
+
+    // youtu.be/VIDEO_ID
+    if (preg_match('~^https?://(?:www\.)?youtu\.be/([a-zA-Z0-9_-]{6,})~', $s, $m)) {
+      return $m[1];
+    }
+
+    // youtube.com/watch?v=VIDEO_ID
+    if (preg_match('~^https?://(?:www\.)?youtube\.com/watch\?([^#]+)~', $s, $m)) {
+      parse_str($m[1], $q);
+      if (!empty($q['v']) && preg_match('~^[a-zA-Z0-9_-]{6,}$~', $q['v'])) return $q['v'];
+      return null;
+    }
+
+    // youtube.com/embed/VIDEO_ID
+    if (preg_match('~^https?://(?:www\.)?youtube\.com/embed/([a-zA-Z0-9_-]{6,})~', $s, $m)) {
+      return $m[1];
+    }
+
+    // youtube.com/shorts/VIDEO_ID
+    if (preg_match('~^https?://(?:www\.)?youtube\.com/shorts/([a-zA-Z0-9_-]{6,})~', $s, $m)) {
+      return $m[1];
+    }
+
+    return null;
+  }
+
+  private static function renderYouTubeEmbed($videoId){
+    $videoId = trim((string)$videoId);
+    if (!preg_match('~^[a-zA-Z0-9_-]{6,}$~', $videoId)) return '<p>[video]</p>';
+
+    // privacy-friendly domain
+    $src = 'https://www.youtube-nocookie.com/embed/'.rawurlencode($videoId);
+
+    return
+      '<div class="md-video">'.
+        '<iframe loading="lazy" src="'.htmlspecialchars($src, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8').'" '.
+        'title="YouTube video" frameborder="0" '.
+        'allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" '.
+        'allowfullscreen></iframe>'.
+      '</div>';
+  }
+}
+
+const TIPI_VERSION = '0.1.0-preview';
+const TIPI_SETUP_HASH = '';
+const MAX_CONTENT = 262144;
+
+function e(string $s): string { return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
+function fail(string $m, int $code = 400): never { throw new RuntimeException($m, $code); }
+function jsonout(array $v, int $status = 200): never {
+    http_response_code($status); header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store'); echo json_encode($v, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR); exit;
+}
+function redirect(string $p): never { header('Location: '.$p, true, 303); exit; }
+function atomic(string $path, string $data): void {
+    $dir = dirname($path);
+    if (!is_dir($dir) && !mkdir($dir, 0700, true) && !is_dir($dir)) fail('Stockage indisponible', 500);
+    $tmp = tempnam($dir, '.tmp-');
+    if ($tmp === false) fail('Écriture impossible', 500);
+    try {
+        if (file_put_contents($tmp, $data) !== strlen($data)) fail('Écriture incomplète', 500);
+        chmod($tmp, 0600);
+        if (!rename($tmp, $path)) fail('Publication impossible', 500);
+    } finally { if (is_file($tmp)) unlink($tmp); }
+}
+function jread(string $path): array {
+    if (!is_file($path)) return [];
+    $r = json_decode((string)file_get_contents($path), true, 64, JSON_THROW_ON_ERROR);
+    if (!is_array($r)) fail('Configuration invalide', 500);
+    return $r;
+}
+function jwrite(string $path, array $data): void { atomic($path, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)); }
+function dataDir(): string {
+    $override = getenv('TIPI_DATA_DIR');
+    $home = getenv('HOME') ?: dirname(__DIR__);
+    $path = $override ?: rtrim($home, '/\\').'/.tipi-cms/'.substr(hash('sha256', __DIR__), 0, 20);
+    if (!str_starts_with($path, '/') && !preg_match('~^[A-Za-z]:[\\\\/]~', $path)) fail('TIPI_DATA_DIR doit être absolu', 500);
+    if (is_link($path)) fail('Stockage symbolique interdit', 500);
+    $probe = $path;
+    while (!file_exists($probe) && dirname($probe) !== $probe) $probe = dirname($probe);
+    $real = realpath($probe);
+    $root = realpath($_SERVER['DOCUMENT_ROOT'] ?: __DIR__) ?: __DIR__;
+    $norm = static fn($v) => rtrim(str_replace('\\', '/', $v), '/').'/';
+    if ($real === false || str_starts_with(strtolower($norm($real)), strtolower($norm($root)))) fail('Stockage privé hors racine web obligatoire', 500);
+    if (preg_match('~(?:^|[/\\\\])\.\.(?:[/\\\\]|$)~', $path)) fail('Chemin de stockage invalide', 500);
+    return $path;
+}
+function locked(string $dir, callable $fn): mixed {
+    $f = fopen($dir.'/write.lock', 'c');
+    if (!$f) fail('Verrou indisponible', 500);
+    try { if (!flock($f, LOCK_EX)) fail('Verrou indisponible', 500); return $fn(); }
+    finally { flock($f, LOCK_UN); fclose($f); }
+}
+function slugok(string $slug): string {
+    if (!preg_match('~^(?:blog/)?[a-z0-9][a-z0-9-]{0,99}$~D', $slug)) fail('Identifiant de page invalide');
+    if (in_array($slug, ['admin','api','assets','robots','sitemap','404'], true)) fail('Identifiant réservé');
+    return $slug;
+}
+function pageurl(string $slug): string { return $slug === 'home' ? '/' : '/'.$slug; }
+function front(string $raw): array {
+    $raw = str_replace(["\r\n","\r"], "\n", $raw);
+    if (!str_starts_with($raw, "---\n") || ($end = strpos($raw,"\n---\n",4)) === false) fail('En-tête Markdown manquant ou invalide');
+    $meta = [];
+    foreach (explode("\n",substr($raw,4,$end-4)) as $line) {
+        if (trim($line)==='' || str_starts_with(trim($line),'#')) continue;
+        if (!preg_match('~^([a-z_][a-z0-9_]*):[ \t]*(.*)$~D',$line,$m)) fail('Métadonnée invalide');
+        if (isset($meta[$m[1]])) fail('Métadonnée dupliquée');
+        $meta[$m[1]]=trim($m[2]);
+    }
+    if (empty($meta['title'])) fail('Le titre est obligatoire');
+    return [$meta, substr($raw,$end+5)];
+}
+function encodeDoc(array $meta, string $body): string {
+    $lines=['---'];
+    foreach($meta as $k=>$v) {
+        if (!preg_match('~^[a-z_][a-z0-9_]*$~D',(string)$k) || !is_scalar($v) || preg_match('~[\r\n\x00]~',(string)$v)) fail('Métadonnée invalide');
+        $lines[]=$k.': '.(string)$v;
+    }
+    return implode("\n",$lines)."\n---\n".$body;
+}
+function rawDoc(string $title, string $body, array $extra=[]): string {
+    return encodeDoc(array_merge(['title'=>$title,'description'=>'','date'=>gmdate('Y-m-d')],$extra),$body);
+}
+function fileDoc(string $d,string $slug,string $state): string { return $d.'/'.$state.'/'.slugok($slug).'.md'; }
+function loadDoc(string $d,string $slug,string $state): ?string {
+    $f=fileDoc($d,$slug,$state); return is_file($f)?(string)file_get_contents($f):null;
+}
+function effective(string $d,string $slug): ?string { return loadDoc($d,$slug,'drafts') ?? loadDoc($d,$slug,'published'); }
+function sha(?string $raw): string { return $raw===null?'':hash('sha256',$raw); }
+function inventory(string $d,string $state='published'): array {
+    $out=[];
+    foreach (['','blog/'] as $sub) foreach (glob($d.'/'.$state.'/'.$sub.'*.md')?:[] as $f) {
+        $slug=$sub.basename($f,'.md');
+        try { slugok($slug); [$meta]=front((string)file_get_contents($f)); $out[$slug]=$meta; } catch(RuntimeException $ignored) {}
+    }
+    ksort($out); return $out;
+}
+function snapshot(string $d,string $slug): string {
+    $id=gmdate('YmdHis').'-'.bin2hex(random_bytes(6));
+    jwrite($d.'/history/'.$slug.'/'.$id.'.json', ['slug'=>$slug,'published'=>loadDoc($d,$slug,'published'),'draft'=>loadDoc($d,$slug,'drafts'),'time'=>gmdate(DATE_ATOM)]);
+    return $id;
+}
+function saveDoc(string $d,string $slug,string $raw,string $expected,bool $publish): array {
+    slugok($slug);
+    if (strlen($raw)>MAX_CONTENT || !preg_match('//u',$raw)) fail('Contenu trop volumineux ou UTF-8 invalide');
+    [$meta,$body]=front($raw);
+    return locked($d,function()use($d,$slug,$meta,$body,$expected,$publish){
+        $current=effective($d,$slug);
+        if (!hash_equals(sha($current),$expected)) fail('Conflit de version : rechargez le document',409);
+        if ($current!==null) { [$prev]=front($current); $meta['id']=$prev['id']??bin2hex(random_bytes(12)); }
+        else $meta['id']=bin2hex(random_bytes(12));
+        $meta['modified']=gmdate(DATE_ATOM);
+        if ($publish) {
+            $live=loadDoc($d,$slug,'published');
+            $meta['published_at']=$live!==null?(front($live)[0]['published_at']??gmdate(DATE_ATOM)):gmdate(DATE_ATOM);
+        }
+        $raw=encodeDoc($meta,$body);
+        $rev=snapshot($d,$slug);
+        atomic(fileDoc($d,$slug,$publish?'published':'drafts'),$raw);
+        if ($publish && is_file(fileDoc($d,$slug,'drafts'))) unlink(fileDoc($d,$slug,'drafts'));
+        return ['slug'=>$slug,'sha256'=>sha($raw),'revision'=>$rev,'status'=>$publish?'published':'draft','url'=>pageurl($slug)];
+    });
+}
+function restoreDoc(string $d,string $slug,string $rev,string $expected): void {
+    slugok($slug);
+    if (!preg_match('~^\d{14}-[a-f0-9]{12}$~D',$rev)) fail('Révision invalide');
+    locked($d,function()use($d,$slug,$rev,$expected){
+        if (!hash_equals(sha(effective($d,$slug)),$expected)) fail('Conflit de version',409);
+        $s=jread($d.'/history/'.$slug.'/'.$rev.'.json');
+        if (($s['slug']??null)!==$slug || !array_key_exists('published',$s)||!array_key_exists('draft',$s)) fail('Révision inconnue',404);
+        snapshot($d,$slug);
+        foreach (['published'=>'published','drafts'=>'draft'] as $state=>$key) {
+            $f=fileDoc($d,$slug,$state);
+            if (is_string($s[$key])) atomic($f,$s[$key]); elseif(is_file($f)) unlink($f);
+        }
+    });
+}
+function noindex(array $m): bool { return in_array(strtolower($m['noindex']??''),['true','yes','1','on'],true); }
+function siteurl(string $s): string {
+    $p=parse_url($s);
+    if (!$p || !isset($p['scheme'],$p['host']) || isset($p['user'],$p['pass'],$p['query'],$p['fragment']) || !in_array($p['path']??'',['','/'],true)) fail('URL de domaine invalide');
+    if (array_intersect(['user','pass','query','fragment'],array_keys($p))) fail('URL de domaine invalide');
+    if ($p['scheme']!=='https' && !($p['scheme']==='http' && in_array($p['host'],['localhost','127.0.0.1','[::1]'],true))) fail('HTTPS obligatoire sauf test local');
+    if (!filter_var($s,FILTER_VALIDATE_URL)) fail('URL invalide');
+    return rtrim($s,'/');
+}
+function sessionStart(): void {
+    ini_set('session.use_strict_mode','1');
+    session_name('tipi_cms_'.substr(hash('sha256',__DIR__),0,12));
+    session_set_cookie_params(['path'=>'/','secure'=>!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off','httponly'=>true,'samesite'=>'Strict']);
+    session_start();
+    if (empty($_SESSION['csrf'])) $_SESSION['csrf']=bin2hex(random_bytes(32));
+}
+function csrf(): string { return '<input type="hidden" name="csrf" value="'.e($_SESSION['csrf']).'">'; }
+function verifyCsrf(): void { if (!hash_equals($_SESSION['csrf'],(string)($_POST['csrf']??''))) fail('Requête non autorisée',403); }
+function field(string $name,string $label,string $value='',string $type='text'): string {
+    return '<label>'.e($label).'<input name="'.e($name).'" type="'.e($type).'" value="'.e($value).'" required></label>';
+}
+function css(): string {
+    return 'html{font:17px/1.65 system-ui,sans-serif;color:#182c23;background:#f7f8f5}*{box-sizing:border-box}body{margin:0}header,main,footer{max-width:900px;margin:auto;padding:24px}header{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px;border-bottom:1px solid #dce3d9}nav a{margin-right:16px}a{color:#176044}h1,h2,h3{line-height:1.2}h1{font-size:clamp(2rem,5vw,3.5rem)}main{min-height:65vh}label{display:block;margin:14px 0}input,textarea,select{display:block;width:100%;padding:12px;border:1px solid #aebbb1;border-radius:6px;background:white;color:#182c23;font:inherit}textarea{min-height:360px;font:14px/1.6 monospace}button,.btn{display:inline-block;background:#244d39;color:white;padding:10px 18px;border:0;border-radius:6px;text-decoration:none;cursor:pointer;font:inherit;margin:5px 5px 5px 0}button.secondary{background:#65796a}img{max-width:100%;height:auto}pre{overflow:auto;padding:14px;background:#e7ede5}code{overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{padding:8px;text-align:left;border-bottom:1px solid #dce3d9}.panel{padding:24px;background:white;border:1px solid #dce3d9;border-radius:12px}.muted{color:#53645b}footer{border-top:1px solid #dce3d9}iframe{max-width:100%}.md-table-wrap{overflow:auto}';
+}
+function shell(string $title,string $body,string $head='',string $nav='',string $brand='Tipi CMS'): void {
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'.e($title).'</title>'.$head.'<style>'.css().'</style></head><body><header><strong><a href="/">'.e($brand).'</a></strong><nav>'.$nav.'</nav></header><main>'.$body.'</main><footer>Propulsé par Tipi CMS</footer></body></html>';
+}
+function navFor(string $d): string {
+    $links=[];
+    foreach(inventory($d) as $slug=>$m) if (!str_contains($slug,'/') && $slug!=='home' && isset($m['nav']) && !noindex($m)) $links[]=['slug'=>$slug,'label'=>$m['nav_label']??$m['title'],'order'=>(int)$m['nav']];
+    usort($links,fn($a,$b)=>$a['order']<=>$b['order']);
+    return implode('',array_map(fn($x)=>'<a href="'.e(pageurl($x['slug'])).'">'.e($x['label']).'</a>',$links));
+}
+function renderBody(string $d,string $body): string {
+    // Only whole-line includes and blog lists; no executable PHP or raw HTML.
+    $out=''; $buf=[]; $fenced=false;
+    $flush=static function()use(&$out,&$buf){if($buf){$out.=MiniMarkdown::toHtml(implode("\n",$buf));$buf=[];}};
+    foreach(explode("\n",$body) as $line) {
+        if (preg_match('~^\s*\x60{3}~',$line)) $fenced=!$fenced;
+        if (!$fenced && trim($line)==='{{list:blog}}') {
+            $flush(); $posts=array_filter(inventory($d),fn($m,$k)=>str_starts_with($k,'blog/')&&!noindex($m),ARRAY_FILTER_USE_BOTH);
+            uasort($posts,fn($a,$b)=>strcmp($b['published_at']??$b['date']??'',$a['published_at']??$a['date']??''));
+            foreach($posts as $slug=>$m) $out.='<article><h2><a href="'.e(pageurl($slug)).'">'.e($m['title']).'</a></h2><p>'.e($m['description']??'').'</p></article>';
+        } elseif (!$fenced && preg_match('~^\s*\{\{include:partials/([a-z0-9-]+)\.md\}\}\s*$~D',$line,$m)) {
+            $flush(); $p=$d.'/partials/'.$m[1].'.md'; if(is_file($p)&&!is_link($p)) $out.=MiniMarkdown::toHtml((string)file_get_contents($p));
+        } else $buf[]=$line;
+    }
+    $flush(); return $out;
+}
+function publicPage(string $d,array $cfg,string $slug,bool $preview=false): void {
+    $raw=$preview?effective($d,$slug):loadDoc($d,$slug,'published');
+    if ($raw===null) {http_response_code(404);shell('Page introuvable','<h1>Page introuvable</h1>','<meta name="robots" content="noindex">',navFor($d),$cfg['name']);return;}
+    [$m,$body]=front($raw); $title=$m['seo_title']??$m['title']; $desc=$m['description']??'';
+    $url=$cfg['url'].pageurl($slug);
+    $head='<meta name="description" content="'.e($desc).'"><meta name="robots" content="'.($preview||noindex($m)?'noindex, follow':'index, follow, max-image-preview:large').'"><link rel="canonical" href="'.e($url).'"><meta property="og:title" content="'.e($title).'"><meta property="og:description" content="'.e($desc).'"><meta property="og:url" content="'.e($url).'"><meta property="og:type" content="'.(str_starts_with($slug,'blog/')?'article':'website').'"><meta name="twitter:card" content="summary">';
+    $schema=['@context'=>'https://schema.org','@type'=>str_starts_with($slug,'blog/')?'Article':'WebPage','name'=>$m['title'],'url'=>$url,'description'=>$desc];
+    if(str_starts_with($slug,'blog/')) { $schema['headline']=$m['title']; if(!empty($m['published_at']))$schema['datePublished']=$m['published_at']; if(!empty($m['modified']))$schema['dateModified']=$m['modified']; if(!empty($m['author']))$schema['author']=['@type'=>'Person','name'=>$m['author']]; }
+    $head.='<script type="application/ld+json">'.json_encode($schema,JSON_HEX_TAG|JSON_HEX_AMP|JSON_HEX_APOS|JSON_HEX_QUOT|JSON_UNESCAPED_UNICODE|JSON_THROW_ON_ERROR).'</script>';
+    $html=renderBody($d,$body);
+    if (!preg_match('~<h1>~i',$html)) $html='<h1>'.e($m['title']).'</h1>'.$html;
+    if($preview) $html='<p class="panel">Prévisualisation privée</p>'.$html;
+    shell($title,$html,$head,navFor($d),$cfg['name']);
+}
+function setup(string $d): void {
+    sessionStart();
+    $hash=TIPI_SETUP_HASH;
+    if($hash==='' && getenv('TIPI_SETUP_KEY')) $hash=hash('sha256',getenv('TIPI_SETUP_KEY'));
+    if($hash==='') {http_response_code(403);shell('Installation verrouillée','<h1>Installation verrouillée</h1><p>Générez un installateur personnalisé avec php tipi-install.php --prepare ou configurez TIPI_SETUP_KEY.</p>');return;}
+    if($_SERVER['REQUEST_METHOD']==='POST') {
+        verifyCsrf();
+        if(!hash_equals($hash,hash('sha256',(string)($_POST['key']??'')))) fail('Clé d’installation incorrecte',403);
+        $pw=(string)($_POST['password']??''); if(strlen($pw)<12 || strlen($pw)>200) fail('Mot de passe : 12 à 200 caractères');
+        $name=trim((string)($_POST['name']??'')); if($name===''||strlen($name)>120||preg_match('~[\r\n\x00]~',$name))fail('Nom de site invalide');
+        $url=siteurl(trim((string)($_POST['url']??'')));
+        if (basename(__FILE__)!=='index.php' && file_exists(__DIR__.'/index.php')) fail('index.php existe déjà : utilisez un dossier vide',409);
+        if (file_exists(__DIR__.'/.htaccess')) fail('.htaccess existe déjà : utilisez un dossier vide',409);
+        if(!is_dir($d)&&!mkdir($d,0700,true)&&!is_dir($d))fail('Impossible de créer le stockage privé',500);
+        locked($d,function()use($d,$name,$url,$pw){
+            if(is_file($d.'/config.json'))fail('Déjà installé',409);
+            atomic($d.'/.htaccess',"Require all denied\n");
+            $seed=['home'=>rawDoc($name,"# ".$name."\n\nBienvenue sur votre nouveau site. Modifiez cette page dans l’administration.\n\n## Derniers articles\n\n{{list:blog}}\n"),'blog'=>rawDoc('Blog',"# Blog\n\n{{list:blog}}\n",['nav'=>'10']),'blog/bienvenue'=>rawDoc('Bienvenue',"# Bienvenue\n\nVotre premier article est prêt. Vous pouvez le modifier depuis le panneau d’administration.\n",['description'=>'Découvrez votre nouveau site.','author'=>'Équipe éditoriale'])];
+            foreach($seed as $slug=>$raw){[$m,$b]=front($raw);$m['id']=bin2hex(random_bytes(12));$m['published_at']=gmdate(DATE_ATOM);atomic(fileDoc($d,$slug,'published'),encodeDoc($m,$b));}
+            $source=(string)file_get_contents(__FILE__);
+            $source=preg_replace("~const TIPI_SETUP_HASH = '[a-f0-9]*';~","const TIPI_SETUP_HASH = '';",$source,1);
+            if(basename(__FILE__)!=='index.php')atomic(__DIR__.'/index.php',$source);
+            atomic(__DIR__.'/.htaccess',"Options -Indexes\nDirectoryIndex index.php\nRewriteEngine On\nRewriteRule ^index\.php$ - [L]\nRewriteRule ^tipi-install[^/]*\.php$ - [F,L]\nRewriteRule ^ index.php [L,QSA]\n");
+            jwrite($d.'/config.json',['name'=>$name,'url'=>$url,'password_hash'=>password_hash($pw,PASSWORD_DEFAULT),'api_hash'=>'','api_publish'=>false,'version'=>TIPI_VERSION]);
+        });
+        if(basename(__FILE__)!=='index.php') @unlink(__FILE__);
+        redirect('/admin');
+    }
+    header('Cache-Control: no-store');
+    shell('Installer Tipi CMS','<div class="panel"><h1>Installer Tipi CMS</h1><p>Markdown, PHP, sans base de données.</p><form method="post">'.csrf().field('key','Clé d’installation','','password').field('name','Nom du site').field('url','URL du site','https://').field('password','Mot de passe administrateur (12 caractères minimum)','','password').'<button>Installer</button></form></div>');
+}
+function admin(string $d,array $cfg): void {
+    sessionStart(); header('Cache-Control: no-store'); header('X-Robots-Tag: noindex, nofollow');
+    $post=$_SERVER['REQUEST_METHOD']==='POST';
+    if(empty($_SESSION['admin'])) {
+        if($post){verifyCsrf(); if(password_verify((string)($_POST['password']??''),$cfg['password_hash'])){session_regenerate_id(true);$_SESSION['admin']=true;redirect('/admin');}usleep(400000);fail('Identifiants incorrects',403);}
+        shell('Administration','<div class="panel"><h1>Administration</h1><form method="post">'.csrf().field('password','Mot de passe','','password').'<button>Connexion</button></form></div>');return;
+    }
+    if($post) {
+        verifyCsrf(); $act=(string)($_POST['action']??'');
+        if($act==='logout'){$_SESSION=[];session_destroy();redirect('/admin');}
+        if($act==='rotate') {
+            $token=bin2hex(random_bytes(32));
+            locked($d,function()use($d,$token){$c=jread($d.'/config.json');$c['api_hash']=hash('sha256',$token);$c['api_publish']=false;jwrite($d.'/config.json',$c);});
+            shell('Clé API','<h1>Clé API éditoriale</h1><p>Copiez cette clé maintenant. Elle ne sera plus affichée.</p><pre>'.e($token).'</pre><a href="/admin">Retour</a>');return;
+        }
+        if($act==='revoke'||$act==='api_policy'){
+            locked($d,function()use($d,$act){$c=jread($d.'/config.json');if($act==='revoke'){$c['api_hash']='';$c['api_publish']=false;}else $c['api_publish']=isset($_POST['allow_publish']);jwrite($d.'/config.json',$c);});
+            redirect('/admin');
+        }
+        $slug=slugok((string)($_POST['slug']??''));$expected=(string)($_POST['expected']??'');
+        if($act==='restore') restoreDoc($d,$slug,(string)($_POST['revision']??''),$expected);
+        elseif(in_array($act,['draft','publish'],true))saveDoc($d,$slug,(string)($_POST['raw']??''),$expected,$act==='publish');
+        else fail('Action inconnue');
+        redirect('/admin?edit='.rawurlencode($slug));
+    }
+    $nav='<a href="/admin">Administration</a><a href="/">Voir le site</a>';
+    if(isset($_GET['preview'])){publicPage($d,$cfg,slugok((string)$_GET['preview']),true);return;}
+    if(isset($_GET['edit'])||isset($_GET['new'])){
+        $slug=isset($_GET['edit'])?slugok((string)$_GET['edit']):'';$raw=$slug!==''?effective($d,$slug):null;
+        $rawForm=$raw??rawDoc('Nouvelle page',"\n# Nouvelle page\n\n");
+        $body='<h1>'.($slug===''?'Nouvelle page':e($slug)).'</h1><form method="post">'.csrf().'<input type="hidden" name="expected" value="'.sha($raw).'">'.field('slug','Identifiant (ex. services ou blog/article)',$slug).'<label>Markdown<textarea name="raw" required>'.e($rawForm).'</textarea></label><button name="action" value="draft" class="secondary">Enregistrer le brouillon</button><button name="action" value="publish">Publier</button></form>';
+        if($slug!==''&&$raw!==null){
+            $body.='<p><a href="/admin?preview='.rawurlencode($slug).'">Prévisualiser</a></p><h2>Historique</h2>';
+            $files=glob($d.'/history/'.$slug.'/*.json')?:[];rsort($files);
+            foreach(array_slice($files,0,20) as $f){$rev=basename($f,'.json');$body.='<form method="post">'.csrf().'<input type="hidden" name="slug" value="'.e($slug).'"><input type="hidden" name="expected" value="'.sha($raw).'"><input type="hidden" name="revision" value="'.e($rev).'"><button class="secondary" name="action" value="restore">Restaurer '.e($rev).'</button></form>';}
+        }
+        shell('Édition',$body,'',$nav);return;
+    }
+    $live=inventory($d);$drafts=inventory($d,'drafts');$all=array_replace($live,$drafts);ksort($all);
+    $body='<h1>Vos contenus</h1><p><a class="btn" href="/admin?new=1">Nouvelle page ou article</a></p><table><tr><th>Page</th><th>État</th><th></th></tr>';
+    foreach($all as $slug=>$m)$body.='<tr><td>'.e($m['title']).'<br><small>'.e(pageurl($slug)).'</small></td><td>'.(isset($drafts[$slug])?'Brouillon'.(isset($live[$slug])?' + publié':''):'Publié').'</td><td><a href="/admin?edit='.rawurlencode($slug).'">Modifier</a></td></tr>';
+    $body.='</table><h2>API éditoriale</h2><p>Clé '.(empty($cfg['api_hash'])?'inactive':'active').'. Aucun accès au PHP.</p><form method="post">'.csrf().'<button name="action" value="rotate">Générer / renouveler la clé</button><button class="secondary" name="action" value="revoke">Révoquer</button></form><form method="post">'.csrf().'<label><input style="display:inline;width:auto" type="checkbox" name="allow_publish" '.(!empty($cfg['api_publish'])?'checked':'').'> Autoriser la publication via API</label><button name="action" value="api_policy">Enregistrer</button></form><form method="post">'.csrf().'<button class="secondary" name="action" value="logout">Déconnexion</button></form>';
+    shell('Administration',$body,'',$nav);
+}
+function api(string $d,array $cfg,string $path): never {
+    $auth=$_SERVER['HTTP_AUTHORIZATION']??'';
+    if(empty($cfg['api_hash'])||!preg_match('~^Bearer ([a-f0-9]{64})$~D',$auth,$m)||!hash_equals($cfg['api_hash'],hash('sha256',$m[1])))jsonout(['error'=>'Non autorisé'],401);
+    $method=$_SERVER['REQUEST_METHOD'];
+    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>false,'hub'=>false]);
+    if($method==='GET'&&$path==='/api/v1/pages'){
+        $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
+        foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug))];
+        jsonout(['pages'=>$out]);
+    }
+    if(!preg_match('~^/api/v1/pages/(.+)$~D',$path,$m))jsonout(['error'=>'Route inconnue'],404);
+    $slug=slugok($m[1]);
+    if($method==='GET'){$raw=effective($d,$slug);if($raw===null)jsonout(['error'=>'Introuvable'],404);jsonout(['slug'=>$slug,'raw'=>$raw,'sha256'=>sha($raw),'published'=>loadDoc($d,$slug,'published')!==null,'draft'=>loadDoc($d,$slug,'drafts')!==null]);}
+    if($method==='PUT'){
+        $body=file_get_contents('php://input',false,null,0,MAX_CONTENT+4096);
+        $j=json_decode((string)$body,true,32,JSON_THROW_ON_ERROR);
+        if(!is_array($j)||!isset($j['raw'],$j['expected_sha256'])||!is_string($j['raw'])||!is_string($j['expected_sha256']))fail('raw et expected_sha256 requis');
+        $publish=($j['publish']??false)===true;
+        if($publish&&empty($cfg['api_publish']))fail('Publication API désactivée',403);
+        jsonout(saveDoc($d,$slug,$j['raw'],$j['expected_sha256'],$publish));
+    }
+    jsonout(['error'=>'Méthode non autorisée'],405);
+}
+function main(): void {
+    header('X-Content-Type-Options: nosniff'); header('Referrer-Policy: strict-origin-when-cross-origin'); header('X-Frame-Options: DENY');
+    header("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https:; frame-src https://www.youtube-nocookie.com; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
+    $path=(string)(parse_url($_SERVER['REQUEST_URI']??'/',PHP_URL_PATH)??'/');
+    $d=dataDir();$cfg=jread($d.'/config.json');
+    if(!$cfg){setup($d);return;}
+    if(str_starts_with($path,'/tipi-install')){http_response_code(404);return;}
+    if($path==='/admin'||$path==='/admin/') {admin($d,$cfg);return;}
+    if(str_starts_with($path,'/api/'))api($d,$cfg,$path);
+    if(!in_array($_SERVER['REQUEST_METHOD'],['GET','HEAD'],true)){http_response_code(405);return;}
+    if($path==='/robots.txt'){header('Content-Type: text/plain; charset=utf-8');echo "User-agent: *\nDisallow: /admin\nDisallow: /api/\nSitemap: ".$cfg['url']."/sitemap.xml\n";return;}
+    if($path==='/sitemap.xml'){header('Content-Type: application/xml; charset=utf-8');echo '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">';foreach(inventory($d)as $slug=>$m)if(!noindex($m)){echo '<url><loc>'.e($cfg['url'].pageurl($slug)).'</loc>';if(!empty($m['modified'])&&strtotime($m['modified'])!==false)echo '<lastmod>'.gmdate('Y-m-d',strtotime($m['modified'])).'</lastmod>';echo '</url>';}echo '</urlset>';return;}
+    if($path==='/home'){header('Location: /',true,301);return;}
+    if($path!=='/'&&str_ends_with($path,'/')){header('Location: '.rtrim($path,'/'),true,301);return;}
+    $slug=$path==='/'?'home':ltrim($path,'/');
+    if(!preg_match('~^(?:blog/)?[a-z0-9][a-z0-9-]{0,99}$~D',$slug)||in_array($slug,['admin','api','assets','robots','sitemap','404'],true)){http_response_code(404);shell('Page introuvable','<h1>Page introuvable</h1>','<meta name="robots" content="noindex">');return;}
+    publicPage($d,$cfg,$slug);
+}
+if (PHP_SAPI === 'cli') {
+    if(($argv[1]??'')==='--prepare'){
+        $key=bin2hex(random_bytes(24));$src=(string)file_get_contents(__FILE__);
+        $src=preg_replace("~const TIPI_SETUP_HASH = '[a-f0-9]*';~","const TIPI_SETUP_HASH = '".hash('sha256',$key)."';",$src,1);
+        $dest=getcwd().'/tipi-install-ready.php';if(file_exists($dest)){fwrite(STDERR,"Le fichier existe déjà.\n");exit(1);}atomic($dest,$src);
+        echo "Fichier : ".$dest."\nClé d’installation : ".$key."\n";exit;
+    }
+    echo "Tipi CMS ".TIPI_VERSION." : php tipi-install.php --prepare\n";exit;
+}
+try { main(); } catch(Throwable $ex) {
+    $status=$ex instanceof RuntimeException && $ex->getCode()>=400&&$ex->getCode()<600?$ex->getCode():500;
+    if($ex instanceof JsonException)$status=400;
+    $msg=$status>=500?'Erreur interne. Consultez le journal PHP.':($ex instanceof JsonException?'JSON invalide':$ex->getMessage());
+    if($status>=500)error_log('Tipi CMS: '.$ex->getMessage());
+    if(str_starts_with($_SERVER['REQUEST_URI']??'','/api/'))jsonout(['error'=>$msg],$status);
+    http_response_code($status);shell('Erreur','<h1>Erreur</h1><p>'.e($msg).'</p><a href="/admin">Retour</a>','<meta name="robots" content="noindex">');
+}
