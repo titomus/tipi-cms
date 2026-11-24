@@ -557,6 +557,8 @@ function saveDoc(string $d,string $slug,string $raw,string $expected,bool $publi
     slugok($slug);
     if (strlen($raw)>MAX_CONTENT || !preg_match('//u',$raw)) fail('Contenu trop volumineux ou UTF-8 invalide');
     [$meta,$body]=front($raw);
+    // A human/API/MCP edit takes ownership of the draft away from Hector.
+    unset($meta['hector_draft_owner'],$meta['hector_operation']);
     return locked($d,fn()=>saveDocLocked($d,$slug,$meta,$body,$expected,$publish));
 }
 // Call only while holding the CMS write lock.
@@ -819,8 +821,14 @@ function tipiHectorApply(string $d,array $command,string $token,bool $direct=fal
             $receipt=['id'=>$id,'status'=>'applied','revision'=>sha($written),'mode'=>$mode];
             jwrite($receiptFile,$receipt);return $receipt;
         }
-        if($draft!==null||!hash_equals(sha($live),$expected))fail('Un brouillon ou une version plus récente existe',409);
-        [$meta,$body]=$live!==null?front($live):[['title'=>'','description'=>'','date'=>gmdate('Y-m-d')],''];
+        $source=$live;
+        if($draft!==null){
+            if(!$direct||(front($draft)[0]['hector_draft_owner']??'')!==($h['installation_uid']??'')||!hash_equals(sha($draft),$expected))
+                fail('Un brouillon humain ou une version plus récente existe',409);
+            $source=$draft;
+        }
+        if(!hash_equals(sha($source),$expected))fail('Une version plus récente existe',409);
+        [$meta,$body]=$source!==null?front($source):[['title'=>'','description'=>'','date'=>gmdate('Y-m-d')],''];
         if(dynamicHtml($body))fail('Document dynamique protégé',409);
         if(isset($fields['content_html'],$fields['content_markdown']))fail('Un seul format de contenu accepté',422);
         $map=['title'=>'title','seo_title'=>'seo_title','meta_description'=>'description','author_name'=>'author','category_name'=>'category'];
@@ -839,6 +847,7 @@ function tipiHectorApply(string $d,array $command,string $token,bool $direct=fal
         }
         if(trim($meta['title'])===''||($live===null&&trim($body)===''))fail('Titre et contenu requis',422);
         $meta['hector_operation']=$id;
+        if($direct&&$mode==='draft')$meta['hector_draft_owner']=$h['installation_uid'];else unset($meta['hector_draft_owner']);
         $raw=encodeDoc($meta,$body);
         if(strlen($raw)>MAX_CONTENT)fail('Contenu trop volumineux',422);
         $result=saveDocLocked($d,$slug,$meta,$body,$expected,$mode==='publish');
@@ -940,6 +949,18 @@ function tipiEditorialApi(string $d,array $cfg,string $path): never {
         $slug=slugok(substr($path,strlen($base.'documents/')));
         $doc=locked($d,function()use($d,$slug){
             return tipiHectorDocument($d,$slug);
+        });jsonout(['document'=>$doc]);
+    }
+    if($method==='GET'&&str_starts_with($path,$base.'drafts/')){
+        $slug=slugok(substr($path,strlen($base.'drafts/')));
+        $doc=locked($d,function()use($d,$slug,$token){
+            $h=tipiHubConfig($d);
+            if(!hash_equals((string)($h['access_token']??''),$token))fail('Connexion remplacée',401);
+            $raw=loadDoc($d,$slug,'drafts');if($raw===null)fail('Brouillon introuvable',404);
+            [$meta,$body]=front($raw);
+            if(($meta['hector_draft_owner']??'')!==($h['installation_uid']??''))fail('Brouillon humain protégé',403);
+            return ['slug'=>$slug,'revision'=>sha($raw),'title'=>$meta['title'],'content_html'=>$body,
+                'seo_title'=>$meta['seo_title']??'','meta_description'=>$meta['description']??'','category_name'=>$meta['category']??'','author_name'=>$meta['author']??''];
         });jsonout(['document'=>$doc]);
     }
     if($method==='GET'&&$path===$base.'categories')jsonout(['categories'=>locked($d,fn()=>tipiEditorialCategories($d))]);
