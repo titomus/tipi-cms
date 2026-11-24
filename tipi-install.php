@@ -345,7 +345,7 @@ final class MiniMarkdown {
   }
 }
 
-const TIPI_VERSION = '0.1.0-preview';
+const TIPI_VERSION = '0.2.0-preview';
 const TIPI_SETUP_HASH = '';
 const MAX_CONTENT = 262144;
 
@@ -397,7 +397,7 @@ function locked(string $dir, callable $fn): mixed {
 }
 function slugok(string $slug): string {
     if (!preg_match('~^(?:blog/)?[a-z0-9][a-z0-9-]{0,99}$~D', $slug)) fail('Identifiant de page invalide');
-    if (in_array($slug, ['admin','api','assets','robots','sitemap','404'], true)) fail('Identifiant réservé');
+    if (in_array($slug, ['admin','api','assets','robots','sitemap','404','mcp'], true)) fail('Identifiant réservé');
     return $slug;
 }
 function pageurl(string $slug): string { return $slug === 'home' ? '/' : '/'.$slug; }
@@ -453,6 +453,7 @@ function saveDoc(string $d,string $slug,string $raw,string $expected,bool $publi
         if (!hash_equals(sha($current),$expected)) fail('Conflit de version : rechargez le document',409);
         if ($current!==null) { [$prev]=front($current); $meta['id']=$prev['id']??bin2hex(random_bytes(12)); }
         else $meta['id']=bin2hex(random_bytes(12));
+        unset($meta['published_at']);
         $meta['modified']=gmdate(DATE_ATOM);
         if ($publish) {
             $live=loadDoc($d,$slug,'published');
@@ -503,9 +504,15 @@ function field(string $name,string $label,string $value='',string $type='text'):
 function css(): string {
     return 'html{font:17px/1.65 system-ui,sans-serif;color:#182c23;background:#f7f8f5}*{box-sizing:border-box}body{margin:0}header,main,footer{max-width:900px;margin:auto;padding:24px}header{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px;border-bottom:1px solid #dce3d9}nav a{margin-right:16px}a{color:#176044}h1,h2,h3{line-height:1.2}h1{font-size:clamp(2rem,5vw,3.5rem)}main{min-height:65vh}label{display:block;margin:14px 0}input,textarea,select{display:block;width:100%;padding:12px;border:1px solid #aebbb1;border-radius:6px;background:white;color:#182c23;font:inherit}textarea{min-height:360px;font:14px/1.6 monospace}button,.btn{display:inline-block;background:#244d39;color:white;padding:10px 18px;border:0;border-radius:6px;text-decoration:none;cursor:pointer;font:inherit;margin:5px 5px 5px 0}button.secondary{background:#65796a}img{max-width:100%;height:auto}pre{overflow:auto;padding:14px;background:#e7ede5}code{overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{padding:8px;text-align:left;border-bottom:1px solid #dce3d9}.panel{padding:24px;background:white;border:1px solid #dce3d9;border-radius:12px}.muted{color:#53645b}footer{border-top:1px solid #dce3d9}iframe{max-width:100%}.md-table-wrap{overflow:auto}';
 }
-function shell(string $title,string $body,string $head='',string $nav='',string $brand='Tipi CMS'): void {
+function design(array $cfg): array {
+    $themes=['forest'=>['#176044','#244d39','#f7f8f5','#182c23'],'ink'=>['#2454a6','#1c3156','#f8fafc','#162339'],'sand'=>['#8b4b23','#75401f','#fffaf1','#35291d']];
+    $v=$themes[$cfg['theme']??'forest']??$themes['forest'];
+    $accent=$cfg['accent']??''; if(is_string($accent)&&preg_match('~^#[a-fA-F0-9]{6}$~D',$accent))$v[0]=$v[1]=$accent;
+    return $v;
+}
+function shell(string $title,string $body,string $head='',string $nav='',string $brand='Tipi CMS',array $designConfig=[]): void {
     header('Content-Type: text/html; charset=utf-8');
-    echo '<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'.e($title).'</title>'.$head.'<style>'.css().'</style></head><body><header><strong><a href="/">'.e($brand).'</a></strong><nav>'.$nav.'</nav></header><main>'.$body.'</main><footer>Propulsé par Tipi CMS</footer></body></html>';
+    echo '<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>'.e($title).'</title>'.$head.'<style>'.strtr(css(),array_combine(['#176044','#244d39','#f7f8f5','#182c23'],design($designConfig))).'</style></head><body><header><strong><a href="/">'.e($brand).'</a></strong><nav>'.$nav.'</nav></header><main>'.$body.'</main><footer>Propulsé par Tipi CMS</footer></body></html>';
 }
 function navFor(string $d): string {
     $links=[];
@@ -541,7 +548,7 @@ function publicPage(string $d,array $cfg,string $slug,bool $preview=false): void
     $html=renderBody($d,$body);
     if (!preg_match('~<h1>~i',$html)) $html='<h1>'.e($m['title']).'</h1>'.$html;
     if($preview) $html='<p class="panel">Prévisualisation privée</p>'.$html;
-    shell($title,$html,$head,navFor($d),$cfg['name']);
+    shell($title,$html,$head,navFor($d),$cfg['name'],$cfg);
 }
 function setup(string $d): void {
     sessionStart();
@@ -596,6 +603,25 @@ function admin(string $d,array $cfg): void {
     if($post) {
         verifyCsrf(); $act=(string)($_POST['action']??'');
         if($act==='logout'){$_SESSION=[];session_destroy();redirect('/admin');}
+        if($act==='settings'){
+            $name=trim((string)($_POST['name']??''));$theme=(string)($_POST['theme']??'forest');$accent=trim((string)($_POST['accent']??''));
+            if($name===''||strlen($name)>120||!preg_match('//u',$name)||preg_match('~[\r\n\x00]~',$name))fail('Nom invalide');
+            if(!in_array($theme,['forest','ink','sand'],true)||($accent!==''&&!preg_match('~^#[a-fA-F0-9]{6}$~D',$accent)))fail('Thème ou couleur invalide');
+            locked($d,function()use($d,$name,$theme,$accent){$c=jread($d.'/config.json');$c['name']=$name;$c['theme']=$theme;$c['accent']=$accent;jwrite($d.'/config.json',$c);});
+            redirect('/admin?settings=1');
+        }
+        if($act==='mcp_rotate'){
+            $token=bin2hex(random_bytes(32));
+            locked($d,function()use($d,$token){$c=jread($d.'/config.json');$c['mcp_hash']=hash('sha256',$token);$c['mcp_write']=false;$c['mcp_publish']=false;jwrite($d.'/config.json',$c);});
+            shell('Clé MCP','<h1>Clé MCP</h1><p>Copiez cette clé privée, affichée une seule fois. Lecture seule par défaut.</p><pre>'.e($token).'</pre><a href="/admin?connections=1">Retour</a>');return;
+        }
+        if($act==='mcp_revoke'||$act==='mcp_policy'){
+            locked($d,function()use($d,$act){$c=jread($d.'/config.json');
+                if($act==='mcp_revoke'){$c['mcp_hash']='';$c['mcp_write']=false;$c['mcp_publish']=false;}
+                else{$c['mcp_write']=isset($_POST['mcp_write']);$c['mcp_publish']=$c['mcp_write']&&isset($_POST['mcp_publish']);}
+                jwrite($d.'/config.json',$c);});
+            redirect('/admin?connections=1');
+        }
         if($act==='rotate') {
             $token=bin2hex(random_bytes(32));
             locked($d,function()use($d,$token){$c=jread($d.'/config.json');$c['api_hash']=hash('sha256',$token);$c['api_publish']=false;jwrite($d.'/config.json',$c);});
@@ -611,7 +637,16 @@ function admin(string $d,array $cfg): void {
         else fail('Action inconnue');
         redirect('/admin?edit='.rawurlencode($slug));
     }
-    $nav='<a href="/admin">Administration</a><a href="/">Voir le site</a>';
+    $nav='<a href="/admin">Contenus</a><a href="/admin?settings=1">Apparence</a><a href="/admin?connections=1">Connexions</a><a href="/">Voir le site</a>';
+    if(isset($_GET['settings'])){
+        $choices='';foreach(['forest'=>'Forêt','ink'=>'Encre','sand'=>'Sable'] as $k=>$label)$choices.='<option value="'.$k.'" '.(($cfg['theme']??'forest')===$k?'selected':'').'>'.$label.'</option>';
+        $body='<h1>Apparence du site</h1><form method="post">'.csrf().field('name','Nom du site',$cfg['name']).'<label>Thème<select name="theme">'.$choices.'</select></label><label>Couleur personnalisée (facultatif, #RRGGBB)<input name="accent" value="'.e($cfg['accent']??'').'"></label><button name="action" value="settings">Enregistrer</button></form>';
+        shell('Apparence',$body,'',$nav);return;
+    }
+    if(isset($_GET['connections'])){
+        $body='<h1>Connexions</h1><h2>MCP éditorial natif</h2><p>Endpoint : <code>'.e($cfg['url'].'/mcp').'</code></p><p>Authentification Bearer, clé indépendante de l’API. '.(empty($cfg['mcp_hash'])?'Inactif':'Actif').'. Aucun accès au PHP ni au stockage privé.</p><form method="post">'.csrf().'<button name="action" value="mcp_rotate">Générer / renouveler la clé MCP</button><button class="secondary" name="action" value="mcp_revoke">Révoquer</button></form><form method="post">'.csrf().'<label><input style="display:inline;width:auto" type="checkbox" name="mcp_write" '.(!empty($cfg['mcp_write'])?'checked':'').'> Autoriser les brouillons</label><label><input style="display:inline;width:auto" type="checkbox" name="mcp_publish" '.(!empty($cfg['mcp_publish'])?'checked':'').'> Autoriser la publication (nécessite aussi les brouillons)</label><button name="action" value="mcp_policy">Enregistrer les droits</button></form><p class="muted">MCP 2025-11-25 / 2025-06-18 ; OAuth ChatGPT et moteur CodeGraft de développement non intégrés.</p><h2>API éditoriale</h2><p>Endpoint : <code>'.e($cfg['url'].'/api/v1').'</code>. La clé API se gère dans Contenus.</p><h2>Le Tipi</h2><p>Association au Hub non disponible dans cette version.</p>';
+        shell('Connexions',$body,'',$nav);return;
+    }
     if(isset($_GET['preview'])){publicPage($d,$cfg,slugok((string)$_GET['preview']),true);return;}
     if(isset($_GET['edit'])||isset($_GET['new'])){
         $slug=isset($_GET['edit'])?slugok((string)$_GET['edit']):'';$raw=$slug!==''?effective($d,$slug):null;
@@ -634,7 +669,7 @@ function api(string $d,array $cfg,string $path): never {
     $auth=$_SERVER['HTTP_AUTHORIZATION']??$_SERVER['REDIRECT_HTTP_AUTHORIZATION']??'';
     if(empty($cfg['api_hash'])||!preg_match('~^Bearer ([a-f0-9]{64})$~D',$auth,$m)||!hash_equals($cfg['api_hash'],hash('sha256',$m[1])))jsonout(['error'=>'Non autorisé'],401);
     $method=$_SERVER['REQUEST_METHOD'];
-    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>false,'hub'=>false]);
+    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'markdown','publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','hub'=>false]);
     if($method==='GET'&&$path==='/api/v1/pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
         foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug))];
@@ -653,6 +688,72 @@ function api(string $d,array $cfg,string $path): never {
     }
     jsonout(['error'=>'Méthode non autorisée'],405);
 }
+function mcpTools(): array {
+    $empty=['type'=>'object','properties'=>(object)[],'additionalProperties'=>false];
+    $input=static fn(array $p,array $r)=>['type'=>'object','properties'=>$p,'required'=>$r,'additionalProperties'=>false];
+    $slug=['type'=>'string','description'=>'Identifiant : home, services ou blog/article'];
+    $hash=['type'=>'string','description'=>'Empreinte SHA-256 actuelle ; chaîne vide pour un nouveau document'];
+    $raw=['type'=>'string','description'=>'Document Markdown complet, front matter inclus'];
+    $tool=static fn($n,$d,$schema,$ro)=>['name'=>$n,'description'=>$d,'inputSchema'=>$schema,'annotations'=>['readOnlyHint'=>$ro,'destructiveHint'=>!$ro,'openWorldHint'=>false]];
+    return [
+        $tool('cms_site_info','Informations publiques et droits MCP du site',$empty,true),
+        $tool('cms_list_pages','Liste les documents avec leur état et empreinte',$empty,true),
+        $tool('cms_read_page','Lit le brouillon ou le document publié',$input(['slug'=>$slug],['slug']),true),
+        $tool('cms_save_draft','Crée ou modifie un brouillon privé. Requiert écriture.',$input(['slug'=>$slug,'raw'=>$raw,'expected_sha256'=>$hash],['slug','raw','expected_sha256']),false),
+        $tool('cms_publish','Publie un document Markdown complet. Requiert publication.',$input(['slug'=>$slug,'raw'=>$raw,'expected_sha256'=>$hash],['slug','raw','expected_sha256']),false)
+    ];
+}
+function mcpCall(string $d,array $cfg,string $name,array $args): array {
+    if($name==='cms_site_info')return ['name'=>$cfg['name'],'url'=>$cfg['url'],'version'=>TIPI_VERSION,'storage'=>'markdown','draft_write'=>!empty($cfg['mcp_write']),'publish'=>!empty($cfg['mcp_publish'])];
+    if($name==='cms_list_pages'){
+        $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
+        foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug))];
+        return ['pages'=>$out];
+    }
+    if(!in_array($name,['cms_read_page','cms_save_draft','cms_publish'],true))fail('Outil inconnu',404);
+    if(!isset($args['slug'])||!is_string($args['slug']))fail('slug requis');
+    $slug=slugok($args['slug']);
+    if($name==='cms_read_page'){
+        $raw=effective($d,$slug);if($raw===null)fail('Introuvable',404);
+        return ['slug'=>$slug,'raw'=>$raw,'sha256'=>sha($raw),'published'=>loadDoc($d,$slug,'published')!==null,'draft'=>loadDoc($d,$slug,'drafts')!==null];
+    }
+    if(empty($cfg['mcp_write'])||($name==='cms_publish'&&empty($cfg['mcp_publish'])))fail('Permission MCP désactivée',403);
+    if(!isset($args['raw'],$args['expected_sha256'])||!is_string($args['raw'])||!is_string($args['expected_sha256']))fail('raw et expected_sha256 requis');
+    return saveDoc($d,$slug,$args['raw'],$args['expected_sha256'],$name==='cms_publish');
+}
+function mcp(string $d,array $cfg): never {
+    header('Cache-Control: no-store');header('X-Robots-Tag: noindex, nofollow');
+    $origin=$_SERVER['HTTP_ORIGIN']??'';
+    if($origin!==''&&$origin!==$cfg['url'])jsonout(['error'=>'Origin non autorisée'],403);
+    $auth=$_SERVER['HTTP_AUTHORIZATION']??$_SERVER['REDIRECT_HTTP_AUTHORIZATION']??'';
+    if(empty($cfg['mcp_hash'])||!preg_match('~^Bearer ([a-f0-9]{64})$~D',$auth,$m)||!hash_equals($cfg['mcp_hash'],hash('sha256',$m[1]))){
+        header('WWW-Authenticate: Bearer realm="Tipi CMS MCP"');jsonout(['error'=>'Non autorisé'],401);
+    }
+    if($_SERVER['REQUEST_METHOD']!=='POST'){header('Allow: POST');jsonout(['error'=>'Méthode non autorisée'],405);}
+    if(!str_starts_with(strtolower($_SERVER['CONTENT_TYPE']??''),'application/json'))jsonout(['error'=>'Content-Type application/json requis'],415);
+    $id=null;$err=static function(int $code,string $msg)use(&$id):never{jsonout(['jsonrpc'=>'2.0','id'=>$id,'error'=>['code'=>$code,'message'=>$msg]]);};
+    try{
+        $bytes=file_get_contents('php://input',false,null,0,MAX_CONTENT*6+8192);
+        $j=json_decode((string)$bytes,true,32,JSON_THROW_ON_ERROR);
+    }catch(JsonException $ex){$err(-32700,'JSON invalide');}
+    if(!is_array($j)||($j['jsonrpc']??null)!=='2.0'||!is_string($j['method']??null))$err(-32600,'Requête invalide');
+    $id=$j['id']??null;$method=$j['method'];$p=$j['params']??[];
+    if(!is_array($p)||($id!==null&&!is_int($id)&&!is_string($id)))$err(-32600,'Requête invalide');
+    if(!array_key_exists('id',$j)){http_response_code(202);exit;}
+    if($method==='initialize'){
+        $v=$p['protocolVersion']??'2025-11-25';
+        $result=['protocolVersion'=>in_array($v,['2025-11-25','2025-06-18'],true)?$v:'2025-11-25','capabilities'=>['tools'=>(object)[]],'serverInfo'=>['name'=>'tipi-cms','version'=>TIPI_VERSION]];
+    }elseif($method==='ping')$result=(object)[];
+    elseif($method==='tools/list')$result=['tools'=>mcpTools()];
+    elseif($method==='resources/list')$result=['resources'=>[]];
+    elseif($method==='prompts/list')$result=['prompts'=>[]];
+    elseif($method==='tools/call'){
+        if(!is_string($p['name']??null)||!is_array($p['arguments']??[]))$err(-32602,'Paramètres invalides');
+        try{$data=mcpCall($d,$cfg,$p['name'],$p['arguments']??[]);$result=['content'=>[['type'=>'text','text'=>json_encode($data,JSON_UNESCAPED_UNICODE|JSON_UNESCAPED_SLASHES|JSON_THROW_ON_ERROR)]]];}
+        catch(RuntimeException $ex){$result=['isError'=>true,'content'=>[['type'=>'text','text'=>$ex->getCode()>=500?'Erreur interne':$ex->getMessage()]]];}
+    }else $err(-32601,'Méthode inconnue');
+    jsonout(['jsonrpc'=>'2.0','id'=>$id,'result'=>$result]);
+}
 function main(): void {
     header('X-Content-Type-Options: nosniff'); header('Referrer-Policy: strict-origin-when-cross-origin'); header('X-Frame-Options: DENY');
     header("Content-Security-Policy: default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https:; frame-src https://www.youtube-nocookie.com; script-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'");
@@ -665,13 +766,14 @@ function main(): void {
     if(str_starts_with($path,'/tipi-install')){http_response_code(404);return;}
     if($path==='/admin'||$path==='/admin/') {admin($d,$cfg);return;}
     if(str_starts_with($path,'/api/'))api($d,$cfg,$path);
+    if($path==='/mcp'||$path==='/mcp/')mcp($d,$cfg);
     if(!in_array($_SERVER['REQUEST_METHOD'],['GET','HEAD'],true)){http_response_code(405);return;}
-    if($path==='/robots.txt'){header('Content-Type: text/plain; charset=utf-8');echo "User-agent: *\nDisallow: /admin\nDisallow: /api/\nSitemap: ".$cfg['url']."/sitemap.xml\n";return;}
+    if($path==='/robots.txt'){header('Content-Type: text/plain; charset=utf-8');echo "User-agent: *\nDisallow: /admin\nDisallow: /api/\nDisallow: /mcp\nSitemap: ".$cfg['url']."/sitemap.xml\n";return;}
     if($path==='/sitemap.xml'){header('Content-Type: application/xml; charset=utf-8');echo '<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">';foreach(inventory($d)as $slug=>$m)if(!noindex($m)){echo '<url><loc>'.e($cfg['url'].pageurl($slug)).'</loc>';if(!empty($m['modified'])&&strtotime($m['modified'])!==false)echo '<lastmod>'.gmdate('Y-m-d',strtotime($m['modified'])).'</lastmod>';echo '</url>';}echo '</urlset>';return;}
     if($path==='/home'){header('Location: /',true,301);return;}
     if($path!=='/'&&str_ends_with($path,'/')&&preg_match('~^/(?:blog/)?[a-z0-9][a-z0-9-]{0,99}/$~D',$path)){header('Location: '.rtrim($path,'/'),true,301);return;}
     $slug=$path==='/'?'home':ltrim($path,'/');
-    if(!preg_match('~^(?:blog/)?[a-z0-9][a-z0-9-]{0,99}$~D',$slug)||in_array($slug,['admin','api','assets','robots','sitemap','404'],true)){http_response_code(404);shell('Page introuvable','<h1>Page introuvable</h1>','<meta name="robots" content="noindex">');return;}
+    if(!preg_match('~^(?:blog/)?[a-z0-9][a-z0-9-]{0,99}$~D',$slug)||in_array($slug,['admin','api','assets','robots','sitemap','404','mcp'],true)){http_response_code(404);shell('Page introuvable','<h1>Page introuvable</h1>','<meta name="robots" content="noindex">');return;}
     publicPage($d,$cfg,$slug);
 }
 if (PHP_SAPI === 'cli') {
@@ -688,6 +790,6 @@ try { main(); } catch(Throwable $ex) {
     if($ex instanceof JsonException)$status=400;
     $msg=$status>=500?'Erreur interne. Consultez le journal PHP.':($ex instanceof JsonException?'JSON invalide':$ex->getMessage());
     if($status>=500)error_log('Tipi CMS: '.$ex->getMessage());
-    if(str_starts_with($_SERVER['REQUEST_URI']??'','/api/'))jsonout(['error'=>$msg],$status);
+    if(str_starts_with($_SERVER['REQUEST_URI']??'','/api/')||str_starts_with($_SERVER['REQUEST_URI']??'','/mcp'))jsonout(['error'=>$msg],$status);
     http_response_code($status);shell('Erreur','<h1>Erreur</h1><p>'.e($msg).'</p><a href="/admin">Retour</a>','<meta name="robots" content="noindex">');
 }
