@@ -347,6 +347,7 @@ final class MiniMarkdown {
 
 const TIPI_VERSION = '0.9.0-preview';
 const TIPI_SETUP_HASH = '';
+const TIPI_BUNDLE_B64 = ''; // Populated by the distribution builder.
 const MAX_CONTENT = 262144;
 
 function e(string $s): string { return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
@@ -380,6 +381,7 @@ function dataDir(): string {
     $path = $override ?: rtrim($home, '/\\').'/.tipi-cms/'.substr(hash('sha256', __DIR__), 0, 20);
     if (!str_starts_with($path, '/') && !preg_match('~^[A-Za-z]:[\\\\/]~', $path)) fail('TIPI_DATA_DIR doit être absolu', 500);
     if (is_link($path)) fail('Stockage symbolique interdit', 500);
+    for($part=$path;dirname($part)!==$part;$part=dirname($part))if(is_link($part))fail('Stockage symbolique interdit',500);
     $probe = $path;
     while (!file_exists($probe) && dirname($probe) !== $probe) $probe = dirname($probe);
     $real = realpath($probe);
@@ -1251,13 +1253,73 @@ function publicPage(string $d,array $cfg,string $slug,bool $preview=false): void
     if($preview) $html='<p class="panel">Prévisualisation privée</p>'.$html;
     shell($title,$html,$head,navFor($d),$cfg['name'],$preview?[]:$cfg,$m['template']??'');
 }
+
+function tipiRuntimeRoot(string $d): string {
+    $root=$d.'/runtime';
+    if(!is_link($root)&&is_file($root.'/tipi-system/codegraft/standalone/config.php'))return $root;
+    return dirname(__DIR__);
+}
+function tipiSetupChecks(string $d): array {
+    $parent=$d;
+    while(!file_exists($parent)&&dirname($parent)!==$parent)$parent=dirname($parent);
+    $https=!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off';
+    $local=in_array(preg_replace('/:\d+$/','',(string)($_SERVER['HTTP_HOST']??'')),['localhost','127.0.0.1','[::1]'],true);
+    return ['PHP 8.2 minimum'=>PHP_VERSION_ID>=80200,'DOM / libxml'=>class_exists(DOMDocument::class),
+        'mbstring'=>function_exists('mb_strtolower'),'Sessions PHP'=>function_exists('session_start'),
+        'HTTPS (sauf test local)'=>$https||$local,'Racine du site accessible en écriture'=>is_writable(__DIR__),
+        'Stockage privé accessible en écriture'=>is_dir($parent)&&is_writable($parent)];
+}
+function tipiRemoveNewTree(string $dir): void {
+    if(is_link($dir)||!is_dir($dir))return;
+    foreach(new FilesystemIterator($dir,FilesystemIterator::SKIP_DOTS) as $f){
+        $p=$f->getPathname();
+        if($f->isDir()&&!$f->isLink())tipiRemoveNewTree($p);else @unlink($p);
+    }
+    @rmdir($dir);
+}
+function tipiInstallBundledRuntime(string $d,string $url): void {
+    if(!extension_loaded('pdo_sqlite')||!str_starts_with($url,'https://'))fail('Assistant IA : HTTPS et PDO SQLite requis',422);
+    $raw=base64_decode(TIPI_BUNDLE_B64,true);
+    if($raw===false||$raw===''||strlen($raw)>3000000)fail('Distribution IA absente ou invalide',422);
+    $files=json_decode($raw,true,32,JSON_THROW_ON_ERROR);
+    if(!is_array($files)||count($files)<20||count($files)>50)fail('Distribution IA invalide',422);
+    $root=$d.'/runtime';$vault=$d.'/runtime-vault';
+    if(file_exists($root)||is_link($root)||file_exists($vault)||is_link($vault))fail('Assistant IA déjà installé ou installation incomplète',409);
+    if(!mkdir($root,0700))fail('Création du runtime impossible',500);
+    $vaultCreated=false;
+    try{
+        foreach($files as $path=>$encoded){
+            if(!is_string($path)||!is_string($encoded)||!preg_match('~^(?:tipi-system/(?:codegraft/(?:src/|standalone/)?[A-Za-z]+\.php|contracts/[A-Za-z]+\.php|bridge\.php|developer-guide\.md|contacts-manifest\.json|upstream-manifest\.json)|app/(?:McpActions|Controllers|Views)/Contacts\.php|app/Routes/contacts\.json)$~D',$path)||str_ends_with($path,'/config.php'))fail('Fichier de distribution interdit',422);
+            $bytes=base64_decode($encoded,true);
+            if($bytes===false||strlen($bytes)>500000)fail('Fichier de distribution invalide',422);
+            atomic($root.'/'.$path,$bytes);
+        }
+        foreach(['app/McpActions','app/Controllers','app/Views','app/Services','app/Routes','app/Components','themes/layouts','themes/templates','themes/components','assets/css','assets/js'] as $dir)
+            if(!is_dir($root.'/'.$dir)&&!mkdir($root.'/'.$dir,0700,true))fail('Dossier IA indisponible',500);
+        $sys=$root.'/tipi-system';
+        require_once $sys.'/codegraft/bootstrap.php';
+        if(!mkdir($vault,0700))fail('Coffre IA indisponible',500);
+        $vaultCreated=true;
+        $cg=codegraft($root,$vault,'generic');
+        $cg['vault']->put('admin.json',['password_hash'=>password_hash(bin2hex(random_bytes(32)),PASSWORD_BCRYPT),'created_at'=>gmdate('c')]);
+        $policy=$cg['vault']->policy();$policy['read_dirs']=['app/McpActions'];$policy['write_dirs']=[];
+        $cg['vault']->savePolicy($policy);
+        $cg['vault']->put('endpoint.json',['path'=>'/mcp/','oauth_issuer'=>$url,'oauth_resource'=>$url.'/mcp','oauth_admin_path'=>'/admin?connections=1','created_at'=>gmdate('c')]);
+        atomic($sys.'/codegraft/standalone/config.php',"<?php\nreturn ".var_export(['root'=>$root,'vault'=>$cg['vault']->directory,'adapter'=>'generic'],true).";\n");
+    }catch(Throwable $ex){
+        tipiRemoveNewTree($root);if($vaultCreated)tipiRemoveNewTree($vault);throw $ex;
+    }
+}
+
 function setup(string $d): void {
     sessionStart();
     $hash=TIPI_SETUP_HASH;
     if($hash==='' && getenv('TIPI_SETUP_KEY')) $hash=hash('sha256',getenv('TIPI_SETUP_KEY'));
     if($hash==='') {http_response_code(403);shell('Installation verrouillée','<h1>Installation verrouillée</h1><p>Générez un installateur personnalisé avec php tipi-install.php --prepare ou configurez TIPI_SETUP_KEY.</p>');return;}
+    $checks=tipiSetupChecks($d);
     if($_SERVER['REQUEST_METHOD']==='POST') {
         verifyCsrf();
+        if(in_array(false,$checks,true))fail('Hébergement incompatible : vérifiez les prérequis affichés.',422);
         if(!hash_equals($hash,hash('sha256',(string)($_POST['key']??'')))) fail('Clé d’installation incorrecte',403);
         $pw=(string)($_POST['password']??''); if(strlen($pw)<12 || strlen($pw)>200) fail('Mot de passe : 12 à 200 caractères');
         $name=trim((string)($_POST['name']??'')); if($name===''||strlen($name)>120||preg_match('~[\r\n\x00]~',$name))fail('Nom de site invalide');
@@ -1265,14 +1327,16 @@ function setup(string $d): void {
         if (basename(__FILE__)!=='index.php' && file_exists(__DIR__.'/index.php')) fail('index.php existe déjà : utilisez un dossier vide',409);
         if (file_exists(__DIR__.'/.htaccess')) fail('.htaccess existe déjà : utilisez un dossier vide',409);
         if(!is_dir($d)&&!mkdir($d,0700,true)&&!is_dir($d))fail('Impossible de créer le stockage privé',500);
-        locked($d,function()use($d,$name,$url,$pw){
+        $withAi=isset($_POST['with_ai']);
+        if($withAi&&TIPI_BUNDLE_B64==='')fail('Assistant IA absent de ce paquet',422);
+        locked($d,function()use($d,$name,$url,$pw,$withAi){
             if(is_file($d.'/config.json'))fail('Déjà installé',409);
             atomic($d.'/.htaccess',"Require all denied\n");
             $seed=['home'=>rawDoc($name,"# ".$name."\n\nBienvenue sur votre nouveau site. Modifiez cette page dans l’administration.\n\n## Derniers articles\n\n{{list:blog}}\n"),'blog'=>rawDoc('Blog',"# Blog\n\n{{list:blog}}\n",['nav'=>'10']),'blog/bienvenue'=>rawDoc('Bienvenue',"# Bienvenue\n\nVotre premier article est prêt. Vous pouvez le modifier depuis le panneau d’administration.\n",['description'=>'Découvrez votre nouveau site.','author'=>'Équipe éditoriale'])];
             foreach($seed as $slug=>$raw){[$m,$b]=front($raw);$m['id']=bin2hex(random_bytes(12));$m['published_at']=gmdate(DATE_ATOM);writeDoc($d,$slug,'published',encodeDoc($m,$b));}
             $source=(string)file_get_contents(__FILE__);
             $source=preg_replace("~const TIPI_SETUP_HASH = '[a-f0-9]*';~","const TIPI_SETUP_HASH = '';",$source,1);
-            $createdIndex=false; $createdHtaccess=false;
+            $createdIndex=false; $createdHtaccess=false; $createdRuntime=false;
             try {
             if(basename(__FILE__)!=='index.php') {
                 if(file_exists(__DIR__.'/index.php')) fail('index.php existe déjà',409);
@@ -1281,8 +1345,10 @@ function setup(string $d): void {
             if(file_exists(__DIR__.'/.htaccess')) fail('.htaccess existe déjà',409);
             atomic(__DIR__.'/.htaccess',"Options -Indexes\nDirectoryIndex index.php\nRewriteEngine On\nRewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]\nRewriteRule ^index\.php$ - [L]\nRewriteRule ^tipi-install[^/]*\.php$ - [F,L]\nRewriteRule ^ index.php [L,QSA]\n");
             $createdHtaccess=true; chmod(__DIR__.'/.htaccess',0644);
+            if($withAi){tipiInstallBundledRuntime($d,$url);$createdRuntime=true;}
             jwrite($d.'/config.json',['name'=>$name,'url'=>$url,'password_hash'=>password_hash($pw,PASSWORD_DEFAULT),'api_hash'=>'','api_publish'=>false,'version'=>TIPI_VERSION]);
             } catch(Throwable $error) {
+                if($createdRuntime){tipiRemoveNewTree($d.'/runtime');tipiRemoveNewTree($d.'/runtime-vault');}
                 if($createdHtaccess) @unlink(__DIR__.'/.htaccess');
                 if($createdIndex) @unlink(__DIR__.'/index.php');
                 throw $error;
@@ -1292,7 +1358,11 @@ function setup(string $d): void {
         redirect('/admin');
     }
     header('Cache-Control: no-store');
-    shell('Installer Tipi CMS','<div class="panel"><h1>Installer Tipi CMS</h1><p>HTML natif, PHP, sans base de données.</p><form method="post">'.csrf().field('key','Clé d’installation','','password').field('name','Nom du site').field('url','URL du site','https://').field('password','Mot de passe administrateur (12 caractères minimum)','','password').'<button>Installer</button></form></div>');
+    $list='<ul>';foreach($checks as $label=>$ok)$list.='<li>'.($ok?'✓ ':'✗ ').e($label).'</li>';$list.='</ul>';
+    $ai=TIPI_BUNDLE_B64!==''&&extension_loaded('pdo_sqlite')?'<label><input type="checkbox" name="with_ai" value="1" style="width:auto"> Installer aussi l’assistant IA (HTTPS requis, consultation par défaut)</label>':'<p>Assistant IA optionnel : distribution complète et PDO SQLite nécessaires.</p>';
+    $guess=(!empty($_SERVER['HTTPS'])&&$_SERVER['HTTPS']!=='off'?'https://':'http://').(string)($_SERVER['HTTP_HOST']??'');
+    $button=in_array(false,$checks,true)?'<p>Corrigez les prérequis signalés avant de poursuivre.</p>':'<button>Installer mon site</button>';
+    shell('Installer Tipi CMS','<div class="panel"><h1>Installer Tipi CMS</h1><p>HTML natif, PHP, sans base de données éditoriale.</p>'.$list.'<p>'.(function_exists('curl_init')?'✓ Connexion au Tipi disponible':'✗ cURL manquant : connexion au Tipi indisponible').'</p><form method="post">'.csrf().field('key','Clé d’installation','','password').field('name','Nom du site').field('url','URL du site',$guess).field('password','Mot de passe administrateur (12 caractères minimum)','','password').$ai.$button.'</form></div>');
 }
 function admin(string $d,array $cfg): void {
     sessionStart(); header('Cache-Control: no-store'); header('X-Robots-Tag: noindex, nofollow');
@@ -1305,7 +1375,7 @@ function admin(string $d,array $cfg): void {
         verifyCsrf(); $act=(string)($_POST['action']??'');
         if($act==='logout'){$_SESSION=[];session_destroy();redirect('/admin');}
         if(in_array($act,['ai_profile','ai_approval_mode','ai_deploy','ai_rollback','ai_revoke','ai_approve_module','ai_enable_contacts'],true)){
-            $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
+            $bridge=tipiRuntimeRoot($d).'/tipi-system/bridge.php';
             if(!is_file($bridge)||is_link($bridge))fail('Assistant IA non installé',409);
             require_once $bridge;
             tipiAdminAction($d,$cfg,$act,$_POST);redirect('/admin?connections=1');
@@ -1332,12 +1402,12 @@ function admin(string $d,array $cfg): void {
             redirect('/admin?settings=1');
         }
         if($act==='business_policy'){
-            $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
+            $bridge=tipiRuntimeRoot($d).'/tipi-system/bridge.php';
             if(!is_file($bridge)||is_link($bridge))fail('CodeGraft non installé',409);
             require_once $bridge;
             locked($d,function()use($d){$c=jread($d.'/config.json');$c['business_read']=isset($_POST['business_read']);$c['business_write']=$c['business_read']&&isset($_POST['business_write']);
                 if(isset($_POST['business_approve'])){
-                    $manifest=tipiBusinessManifest(dirname(__DIR__));
+                    $manifest=tipiBusinessManifest(tipiRuntimeRoot($d));
                     $fingerprint=hash('sha256',json_encode($manifest,JSON_THROW_ON_ERROR));
                     if(!hash_equals($fingerprint,(string)($_POST['business_fingerprint']??'')))fail('Les modules ont changé : rechargez et vérifiez les nouvelles versions',409);
                     $c['business_approved']=$manifest;
@@ -1377,7 +1447,7 @@ function admin(string $d,array $cfg): void {
         redirect('/admin?edit='.rawurlencode($slug));
     }
     $nav='<a href="/admin">Contenus</a><a href="/admin?settings=1">Apparence</a><a href="/admin?connections=1">Assistant IA</a><a href="/admin?hub=1">Le Tipi</a><a href="/">Voir le site</a><form method="post" action="/admin" style="display:inline">'.csrf().'<button class="secondary" name="action" value="logout">Déconnexion</button></form>';
-    if(function_exists('tipiAppNav'))$nav.=tipiAppNav(dirname(__DIR__),$cfg,true);
+    if(function_exists('tipiAppNav'))$nav.=tipiAppNav(tipiRuntimeRoot($d),$cfg,true);
     if(isset($_GET['hub'])){shell('Le Tipi',tipiHubPanel($d),'',$nav);return;}
     if(isset($_GET['settings'])){
         $choices='';foreach(['forest'=>'Forêt','ink'=>'Encre','sand'=>'Sable'] as $k=>$label)$choices.='<option value="'.$k.'" '.(($cfg['theme']??'forest')===$k?'selected':'').'>'.$label.'</option>';
@@ -1388,7 +1458,7 @@ function admin(string $d,array $cfg): void {
         shell('Apparence',$body,'',$nav);return;
     }
     if(isset($_GET['connections'])){
-        $system=dirname(__DIR__).'/tipi-system';
+        $system=tipiRuntimeRoot($d).'/tipi-system';
         $body='<h1>Assistant IA</h1>';
         if(is_file($system.'/bridge.php')&&is_file($system.'/codegraft/standalone/config.php')){
             require_once $system.'/bridge.php';$body.=tipiAdminPanel($d,$cfg);
@@ -1424,7 +1494,7 @@ function api(string $d,array $cfg,string $path): never {
     $auth=$_SERVER['HTTP_AUTHORIZATION']??$_SERVER['REDIRECT_HTTP_AUTHORIZATION']??'';
     if(empty($cfg['api_hash'])||!preg_match('~^Bearer ([a-f0-9]{64})$~D',$auth,$m)||!hash_equals($cfg['api_hash'],hash('sha256',$m[1])))jsonout(['error'=>'Non autorisé'],401);
     $method=$_SERVER['REQUEST_METHOD'];
-    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'html','accepted_formats'=>['html','markdown'],'publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','codegraft_bridge'=>is_file(dirname(__DIR__).'/tipi-system/bridge.php'),'hub'=>!empty(tipiHubConfig($d)['access_token']),'hub_tracking'=>tipiHubStatus($d)]);
+    if($method==='GET'&&$path==='/api/v1/capabilities')jsonout(['version'=>TIPI_VERSION,'storage'=>'html','accepted_formats'=>['html','markdown'],'publish'=>!empty($cfg['api_publish']),'mcp'=>true,'mcp_auth'=>'bearer','codegraft_bridge'=>is_file(tipiRuntimeRoot($d).'/tipi-system/bridge.php'),'hub'=>!empty(tipiHubConfig($d)['access_token']),'hub_tracking'=>tipiHubStatus($d)]);
     if($method==='GET'&&$path==='/api/v1/pages'){
         $live=inventory($d);$draft=inventory($d,'drafts');$out=[];
         foreach(array_replace($live,$draft) as $slug=>$m)$out[]=['slug'=>$slug,'title'=>$m['title'],'published'=>isset($live[$slug]),'draft'=>isset($draft[$slug]),'sha256'=>sha(effective($d,$slug)),'state_sha256'=>documentState($d,$slug)];
@@ -1544,8 +1614,8 @@ function main(): void {
     if (!preg_match('~^/[a-zA-Z0-9_./%-]*$~D',$path) || str_contains($path,'//')) fail('URL invalide',400);
     $d=dataDir();$cfg=jread($d.'/config.json');
     if(!$cfg){setup($d);return;}
-    $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
-    $installed=is_file($bridge)&&!is_link($bridge)&&is_file(dirname(__DIR__).'/tipi-system/codegraft/standalone/config.php');
+    $bridge=tipiRuntimeRoot($d).'/tipi-system/bridge.php';
+    $installed=is_file($bridge)&&!is_link($bridge)&&is_file(tipiRuntimeRoot($d).'/tipi-system/codegraft/standalone/config.php');
     if($installed)require_once $bridge;
     // Preserve explicitly configured legacy editorial keys without routing OAuth tokens to the legacy handler.
     if($installed&&in_array($path,['/mcp','/mcp/'],true)){
@@ -1554,8 +1624,8 @@ function main(): void {
         tipiCodeGraftRoute($path,$d,$cfg);return;
     }
     if(in_array($path,['/mcp/oauth/register/','/mcp/oauth/authorize/','/mcp/oauth/token/','/mcp/oauth/register','/mcp/oauth/authorize','/mcp/oauth/token','/.well-known/oauth-protected-resource/mcp','/.well-known/oauth-protected-resource/mcp/','/.well-known/oauth-authorization-server','/.well-known/oauth-authorization-server/','/.well-known/oauth-protected-resource','/.well-known/oauth-protected-resource/'],true)){
-        $bridge=dirname(__DIR__).'/tipi-system/bridge.php';
-        if(!is_file($bridge)||is_link($bridge)||!is_file(dirname(__DIR__).'/tipi-system/codegraft/standalone/config.php')){http_response_code(404);return;}
+        $bridge=tipiRuntimeRoot($d).'/tipi-system/bridge.php';
+        if(!is_file($bridge)||is_link($bridge)||!is_file(tipiRuntimeRoot($d).'/tipi-system/codegraft/standalone/config.php')){http_response_code(404);return;}
         require_once $bridge; tipiCodeGraftRoute($path,$d,$cfg);return;
     }
     if($path==='/tipi-metrics.js'){tipiMetricsAsset();return;}
