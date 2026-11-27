@@ -32,3 +32,20 @@ foreach(["one","two"] as $site){
 }
 echo "Signed distribution and two isolated runtimes OK\n";
 ' "$ROOT/template.php" "$ROOT"
+
+mkdir "$ROOT/update-public" "$ROOT/update-private"
+cp "$ROOT/template.php" "$ROOT/update-public/index.php"
+php -r '
+define("TIPI_LIBRARY_ONLY",true);
+require $argv[1];
+$d=$argv[2];$old=file_get_contents($argv[1]);
+$new=preg_replace("~^const TIPI_VERSION = \x27[^\x27]+\x27;$~m","const TIPI_VERSION = \x2799.0.0\x27;",$old,1,$count);
+if($count!==1||!openssl_sign($new,$signature,openssl_pkey_get_private("file://".$argv[3]),OPENSSL_ALGO_SHA256))exit(1);
+$release=tipiVerifyCoreRelease(json_encode(["source"=>base64_encode($new),"signature"=>base64_encode($signature)]));
+jwrite($d."/config.json",["runtime_layout"=>"private"]);
+tipiCoreUpdate($d,$release);
+if(file_get_contents($argv[1])!==$new)exit(2);
+tipiCoreRollback($d);
+if(file_get_contents($argv[1])!==$old)exit(3);
+echo "Verified core update and rollback OK\n";
+' "$ROOT/update-public/index.php" "$ROOT/update-private" "$ROOT/signing.pem"
