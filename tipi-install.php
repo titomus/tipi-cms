@@ -1256,7 +1256,9 @@ function publicPage(string $d,array $cfg,string $slug,bool $preview=false): void
 
 function tipiRuntimeRoot(string $d): string {
     $root=$d.'/runtime';
-    if(!is_link($root)&&is_file($root.'/tipi-system/codegraft/standalone/config.php'))return $root;
+    // A fresh standalone site must never discover a sibling site's legacy runtime.
+    $cfg=jread($d.'/config.json');
+    if(($cfg['runtime_layout']??'')==='private' || (!is_link($root)&&is_file($root.'/tipi-system/codegraft/standalone/config.php')))return $root;
     return dirname(__DIR__);
 }
 function tipiSetupChecks(string $d): array {
@@ -1346,7 +1348,7 @@ function setup(string $d): void {
             atomic(__DIR__.'/.htaccess',"Options -Indexes\nDirectoryIndex index.php\nRewriteEngine On\nRewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]\nRewriteRule ^index\.php$ - [L]\nRewriteRule ^tipi-install[^/]*\.php$ - [F,L]\nRewriteRule ^ index.php [L,QSA]\n");
             $createdHtaccess=true; chmod(__DIR__.'/.htaccess',0644);
             if($withAi){tipiInstallBundledRuntime($d,$url);$createdRuntime=true;}
-            jwrite($d.'/config.json',['name'=>$name,'url'=>$url,'password_hash'=>password_hash($pw,PASSWORD_DEFAULT),'api_hash'=>'','api_publish'=>false,'version'=>TIPI_VERSION]);
+            jwrite($d.'/config.json',['name'=>$name,'url'=>$url,'password_hash'=>password_hash($pw,PASSWORD_DEFAULT),'api_hash'=>'','api_publish'=>false,'version'=>TIPI_VERSION,'runtime_layout'=>'private']);
             } catch(Throwable $error) {
                 if($createdRuntime){tipiRemoveNewTree($d.'/runtime');tipiRemoveNewTree($d.'/runtime-vault');}
                 if($createdHtaccess) @unlink(__DIR__.'/.htaccess');
