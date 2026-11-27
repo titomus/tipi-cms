@@ -1424,8 +1424,26 @@ function tipiCoreUpdate(string $d,array $release): void {
         if(!is_string($previous)||!str_contains($previous,"const TIPI_VERSION = '".TIPI_VERSION."';"))fail('Le noyau a changé : rechargez la page',409);
         $backup=$d.'/maintenance/core-'.gmdate('YmdHis').'-'.bin2hex(random_bytes(6)).'.php';
         atomic($backup,$previous);
+        jwrite($d.'/maintenance/last-core.json',['file'=>basename($backup),'previous_sha256'=>hash('sha256',$previous),'current_sha256'=>hash('sha256',$release['source'])]);
         atomic($target,$release['source']);chmod($target,0644);
         if(function_exists('opcache_invalidate'))@opcache_invalidate($target,true);
+    });
+}
+function tipiCoreRollback(string $d): void {
+    $target=__DIR__.'/index.php';
+    if(basename(__FILE__)!=='index.php'||is_link($target)||!is_writable(__DIR__))fail('Noyau non modifiable',409);
+    locked($d,function()use($d,$target){
+        $record=jread($d.'/maintenance/last-core.json');
+        $name=(string)($record['file']??'');
+        if(!preg_match('~^core-\d{14}-[a-f0-9]{12}\.php$~D',$name))fail('Aucune version précédente',404);
+        $backup=$d.'/maintenance/'.$name;
+        if(is_link($backup)||!is_file($backup))fail('Sauvegarde indisponible',409);
+        $previous=file_get_contents($backup);
+        if(!is_string($previous)||!hash_equals((string)($record['previous_sha256']??''),hash('sha256',$previous))||
+           !hash_equals((string)($record['current_sha256']??''),(string)hash_file('sha256',$target)))fail('Le noyau ou sa sauvegarde a changé : restauration refusée',409);
+        atomic($target,$previous);chmod($target,0644);
+        if(function_exists('opcache_invalidate'))@opcache_invalidate($target,true);
+        @unlink($d.'/maintenance/last-core.json');
     });
 }
 function tipiEditorialBackup(string $d): never {
@@ -1452,12 +1470,13 @@ function tipiEditorialBackup(string $d): never {
     header('Content-Type: application/octet-stream');header('Content-Disposition: attachment; filename="tipi-editorial-'.gmdate('Y-m-d').'.json"');
     header('X-Content-Type-Options: nosniff');echo $data;exit;
 }
-function tipiMaintenancePanel(): string {
+function tipiMaintenancePanel(string $d): string {
     $form='<form method="post" action="/admin">'.csrf().field('owner_password','Confirmez votre mot de passe','','password');
     $update=TIPI_RELEASE_PUBLIC_KEY_B64!==''&&function_exists('openssl_verify')&&function_exists('curl_init')
         ?$form.'<button name="action" value="maintenance_update">Vérifier et installer une mise à jour signée</button></form>'
         :'<p>Mises à jour web indisponibles : la distribution doit intégrer une clé de publication et PHP doit proposer OpenSSL et cURL.</p>';
-    return '<h1>Maintenance</h1><div class="panel"><h2>Version '.e(TIPI_VERSION).'</h2><p>Le noyau ne peut être mis à jour que depuis une distribution signée par Le Tipi. Une copie du noyau précédent est conservée en privé.</p>'.$update.'</div><div class="panel"><h2>Exporter les contenus</h2><p>Pages, articles, brouillons et historiques. Ne contient ni les identifiants, ni le coffre OAuth, ni les données métier. Conservez ce fichier en lieu sûr. La restauration complète n’est pas encore disponible.</p>'.$form.'<button name="action" value="maintenance_export">Télécharger mes contenus</button></form></div>';
+    $rollback=is_file($d.'/maintenance/last-core.json')?$form.'<button class="secondary" name="action" value="maintenance_rollback">Restaurer la version précédente du noyau</button></form>':'';
+    return '<h1>Maintenance</h1><div class="panel"><h2>Version '.e(TIPI_VERSION).'</h2><p>Le noyau ne peut être mis à jour que depuis une distribution signée par Le Tipi. Une copie du noyau précédent est conservée en privé.</p>'.$update.$rollback.'</div><div class="panel"><h2>Exporter les contenus</h2><p>Pages, articles, brouillons et historiques. Ne contient ni les identifiants, ni le coffre OAuth, ni les données métier. Conservez ce fichier en lieu sûr. La restauration complète n’est pas encore disponible.</p>'.$form.'<button name="action" value="maintenance_export">Télécharger mes contenus</button></form></div>';
 }
 
 function admin(string $d,array $cfg): void {
@@ -1469,9 +1488,10 @@ function admin(string $d,array $cfg): void {
     }
     if($post) {
         verifyCsrf(); $act=(string)($_POST['action']??'');
-        if(in_array($act,['maintenance_update','maintenance_export'],true)){
+        if(in_array($act,['maintenance_update','maintenance_export','maintenance_rollback'],true)){
             if(!password_verify((string)($_POST['owner_password']??''),$cfg['password_hash']))fail('Mot de passe incorrect',403);
             if($act==='maintenance_export')tipiEditorialBackup($d);
+            if($act==='maintenance_rollback'){tipiCoreRollback($d);redirect('/admin?maintenance=1');}
             $release=tipiReleaseFetch();tipiCoreUpdate($d,$release);redirect('/admin?maintenance=1');
         }
         if($act==='logout'){$_SESSION=[];session_destroy();redirect('/admin');}
@@ -1549,7 +1569,7 @@ function admin(string $d,array $cfg): void {
     }
     $nav='<a href="/admin">Contenus</a><a href="/admin?settings=1">Apparence</a><a href="/admin?connections=1">Assistant IA</a><a href="/admin?hub=1">Le Tipi</a><a href="/admin?maintenance=1">Maintenance</a><a href="/">Voir le site</a><form method="post" action="/admin" style="display:inline">'.csrf().'<button class="secondary" name="action" value="logout">Déconnexion</button></form>';
     if(function_exists('tipiAppNav'))$nav.=tipiAppNav(tipiRuntimeRoot($d),$cfg,true);
-    if(isset($_GET['maintenance'])){shell('Maintenance',tipiMaintenancePanel(),'',$nav);return;}
+    if(isset($_GET['maintenance'])){shell('Maintenance',tipiMaintenancePanel($d),'',$nav);return;}
     if(isset($_GET['hub'])){shell('Le Tipi',tipiHubPanel($d),'',$nav);return;}
     if(isset($_GET['settings'])){
         $choices='';foreach(['forest'=>'Forêt','ink'=>'Encre','sand'=>'Sable'] as $k=>$label)$choices.='<option value="'.$k.'" '.(($cfg['theme']??'forest')===$k?'selected':'').'>'.$label.'</option>';
