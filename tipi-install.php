@@ -348,6 +348,7 @@ final class MiniMarkdown {
 const TIPI_VERSION = '0.9.0-preview';
 const TIPI_SETUP_HASH = '';
 const TIPI_BUNDLE_B64 = ''; // Populated by the distribution builder.
+const TIPI_RELEASE_PUBLIC_KEY_B64 = ''; // Pinned by the release builder.
 const MAX_CONTENT = 262144;
 
 function e(string $s): string { return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
@@ -1366,6 +1367,80 @@ function setup(string $d): void {
     $button=in_array(false,$checks,true)?'<p>Corrigez les prérequis signalés avant de poursuivre.</p>':'<button>Installer mon site</button>';
     shell('Installer Tipi CMS','<div class="panel"><h1>Installer Tipi CMS</h1><p>HTML natif, PHP, sans base de données éditoriale.</p>'.$list.'<p>'.(function_exists('curl_init')?'✓ Connexion au Tipi disponible':'✗ cURL manquant : connexion au Tipi indisponible').'</p><form method="post">'.csrf().field('key','Clé d’installation','','password').field('name','Nom du site').field('url','URL du site',$guess).field('password','Mot de passe administrateur (12 caractères minimum)','','password').$ai.$button.'</form></div>');
 }
+
+function tipiVerifyCoreRelease(string $json): array {
+    if(TIPI_RELEASE_PUBLIC_KEY_B64===''||!function_exists('openssl_verify'))fail('Clé de mise à jour ou OpenSSL indisponible',503);
+    if(strlen($json)>10000000)fail('Paquet trop volumineux',413);
+    $package=json_decode($json,true,16,JSON_THROW_ON_ERROR);
+    if(!is_array($package)||!is_string($package['source']??null)||!is_string($package['signature']??null))fail('Paquet invalide',422);
+    $source=base64_decode($package['source'],true);$sig=base64_decode($package['signature'],true);$key=base64_decode(TIPI_RELEASE_PUBLIC_KEY_B64,true);
+    if(!is_string($source)||strlen($source)>6000000||!is_string($sig)||!is_string($key)||openssl_verify($source,$sig,$key,OPENSSL_ALGO_SHA256)!==1)fail('Signature de la mise à jour invalide',422);
+    if(!str_starts_with($source,"<?php\n")||!preg_match("~^const TIPI_VERSION = '([0-9]+\\.[0-9]+\\.[0-9]+(?:-preview)?)';$~m",$source,$v)||
+       !preg_match("~^const TIPI_SETUP_HASH = '';$~m",$source)||
+       !preg_match("~^const TIPI_RELEASE_PUBLIC_KEY_B64 = '([A-Za-z0-9+/=]+)';~m",$source,$k)||!hash_equals(TIPI_RELEASE_PUBLIC_KEY_B64,$k[1])||
+       !preg_match("~^const TIPI_BUNDLE_B64 = '([A-Za-z0-9+/=]*)';~m",$source,$b))fail('Paquet incompatible',422);
+    return ['source'=>$source,'version'=>$v[1],'bundle'=>$b[1]];
+}
+function tipiReleaseFetch(): array {
+    if(!function_exists('curl_init'))fail('cURL indisponible',503);
+    $body='';$overflow=false;
+    $ch=curl_init(TIPI_HUB_ORIGIN.'/tipi-cms/release.json');
+    curl_setopt_array($ch,[CURLOPT_CONNECTTIMEOUT=>5,CURLOPT_TIMEOUT=>30,CURLOPT_FOLLOWLOCATION=>false,CURLOPT_SSL_VERIFYPEER=>true,CURLOPT_SSL_VERIFYHOST=>2,
+        CURLOPT_WRITEFUNCTION=>static function($ch,string $chunk)use(&$body,&$overflow):int{
+            if(strlen($body)+strlen($chunk)>10000000){$overflow=true;return 0;}$body.=$chunk;return strlen($chunk);
+        }]);
+    $ok=curl_exec($ch);$status=(int)curl_getinfo($ch,CURLINFO_RESPONSE_CODE);curl_close($ch);
+    if($overflow||$ok===false||$status!==200)fail('Aucune distribution vérifiée disponible pour le moment',503);
+    return tipiVerifyCoreRelease($body);
+}
+function tipiCoreUpdate(string $d,array $release): void {
+    if(version_compare($release['version'],TIPI_VERSION,'<='))fail('Aucune version plus récente',409);
+    // A core update must not silently change the installed OAuth runtime.
+    if(is_file(tipiRuntimeRoot($d).'/tipi-system/bridge.php')&&!hash_equals(TIPI_BUNDLE_B64,$release['bundle']))
+        fail('Cette version modifie également le moteur IA : une migration compatible est nécessaire',409);
+    $target=__DIR__.'/index.php';
+    if(basename(__FILE__)!=='index.php'||is_link($target)||!is_writable(__DIR__))fail('Noyau non modifiable',409);
+    locked($d,function()use($d,$target,$release){
+        $previous=file_get_contents($target);
+        if(!is_string($previous)||!str_contains($previous,"const TIPI_VERSION = '".TIPI_VERSION."';"))fail('Le noyau a changé : rechargez la page',409);
+        $backup=$d.'/maintenance/core-'.gmdate('YmdHis').'-'.bin2hex(random_bytes(6)).'.php';
+        atomic($backup,$previous);
+        atomic($target,$release['source']);chmod($target,0644);
+        if(function_exists('opcache_invalidate'))@opcache_invalidate($target,true);
+    });
+}
+function tipiEditorialBackup(string $d): never {
+    // A portable editorial export; no credentials, OAuth vault or business databases.
+    $snapshot=locked($d,function()use($d){
+        $files=[];$bytes=0;
+        foreach(['published','drafts','history','trash','partials','design-history'] as $folder){
+            $base=$d.'/'.$folder;
+            if(!is_dir($base))continue;
+            if(is_link($base))fail('Dossier symbolique interdit',409);
+            foreach(new RecursiveIteratorIterator(new RecursiveDirectoryIterator($base,FilesystemIterator::SKIP_DOTS)) as $f){
+                if($f->isLink()||!$f->isFile())fail('Fichier non sûr',409);
+                $path=substr($f->getPathname(),strlen($d)+1);
+                $size=$f->getSize();$bytes+=$size;
+                if($bytes>16000000||count($files)>=5000)fail('Export trop volumineux pour le navigateur',413);
+                $data=file_get_contents($f->getPathname());
+                if(!is_string($data)||strlen($data)!==$size)fail('Lecture de sauvegarde incomplète',500);
+                $files[$path]=base64_encode($data);
+            }
+        }
+        return ['format'=>'tipi-editorial-backup-v1','version'=>TIPI_VERSION,'created_at'=>gmdate(DATE_ATOM),'files'=>$files];
+    });
+    $data=json_encode($snapshot,JSON_THROW_ON_ERROR|JSON_UNESCAPED_SLASHES);
+    header('Content-Type: application/octet-stream');header('Content-Disposition: attachment; filename="tipi-editorial-'.gmdate('Y-m-d').'.json"');
+    header('X-Content-Type-Options: nosniff');echo $data;exit;
+}
+function tipiMaintenancePanel(): string {
+    $form='<form method="post" action="/admin">'.csrf().field('owner_password','Confirmez votre mot de passe','','password');
+    $update=TIPI_RELEASE_PUBLIC_KEY_B64!==''&&function_exists('openssl_verify')&&function_exists('curl_init')
+        ?$form.'<button name="action" value="maintenance_update">Vérifier et installer une mise à jour signée</button></form>'
+        :'<p>Mises à jour web indisponibles : la distribution doit intégrer une clé de publication et PHP doit proposer OpenSSL et cURL.</p>';
+    return '<h1>Maintenance</h1><div class="panel"><h2>Version '.e(TIPI_VERSION).'</h2><p>Le noyau ne peut être mis à jour que depuis une distribution signée par Le Tipi. Une copie du noyau précédent est conservée en privé.</p>'.$update.'</div><div class="panel"><h2>Exporter les contenus</h2><p>Pages, articles, brouillons et historiques. Ne contient ni les identifiants, ni le coffre OAuth, ni les données métier. Conservez ce fichier en lieu sûr. La restauration complète n’est pas encore disponible.</p>'.$form.'<button name="action" value="maintenance_export">Télécharger mes contenus</button></form></div>';
+}
+
 function admin(string $d,array $cfg): void {
     sessionStart(); header('Cache-Control: no-store'); header('X-Robots-Tag: noindex, nofollow');
     $post=$_SERVER['REQUEST_METHOD']==='POST';
@@ -1375,6 +1450,11 @@ function admin(string $d,array $cfg): void {
     }
     if($post) {
         verifyCsrf(); $act=(string)($_POST['action']??'');
+        if(in_array($act,['maintenance_update','maintenance_export'],true)){
+            if(!password_verify((string)($_POST['owner_password']??''),$cfg['password_hash']))fail('Mot de passe incorrect',403);
+            if($act==='maintenance_export')tipiEditorialBackup($d);
+            $release=tipiReleaseFetch();tipiCoreUpdate($d,$release);redirect('/admin?maintenance=1');
+        }
         if($act==='logout'){$_SESSION=[];session_destroy();redirect('/admin');}
         if(in_array($act,['ai_profile','ai_approval_mode','ai_deploy','ai_rollback','ai_revoke','ai_approve_module','ai_enable_contacts'],true)){
             $bridge=tipiRuntimeRoot($d).'/tipi-system/bridge.php';
@@ -1448,8 +1528,9 @@ function admin(string $d,array $cfg): void {
         else fail('Action inconnue');
         redirect('/admin?edit='.rawurlencode($slug));
     }
-    $nav='<a href="/admin">Contenus</a><a href="/admin?settings=1">Apparence</a><a href="/admin?connections=1">Assistant IA</a><a href="/admin?hub=1">Le Tipi</a><a href="/">Voir le site</a><form method="post" action="/admin" style="display:inline">'.csrf().'<button class="secondary" name="action" value="logout">Déconnexion</button></form>';
+    $nav='<a href="/admin">Contenus</a><a href="/admin?settings=1">Apparence</a><a href="/admin?connections=1">Assistant IA</a><a href="/admin?hub=1">Le Tipi</a><a href="/admin?maintenance=1">Maintenance</a><a href="/">Voir le site</a><form method="post" action="/admin" style="display:inline">'.csrf().'<button class="secondary" name="action" value="logout">Déconnexion</button></form>';
     if(function_exists('tipiAppNav'))$nav.=tipiAppNav(tipiRuntimeRoot($d),$cfg,true);
+    if(isset($_GET['maintenance'])){shell('Maintenance',tipiMaintenancePanel(),'',$nav);return;}
     if(isset($_GET['hub'])){shell('Le Tipi',tipiHubPanel($d),'',$nav);return;}
     if(isset($_GET['settings'])){
         $choices='';foreach(['forest'=>'Forêt','ink'=>'Encre','sand'=>'Sable'] as $k=>$label)$choices.='<option value="'.$k.'" '.(($cfg['theme']??'forest')===$k?'selected':'').'>'.$label.'</option>';
