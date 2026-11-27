@@ -1,0 +1,25 @@
+name: CMS distribution checks
+on:
+  pull_request:
+    paths:
+      - '**'
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PHP extensions
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y php-cli php-xml php-mbstring php-sqlite3 php-curl openssl
+      - name: Lint and local integration
+        run: |
+          php -v
+          php -l tipi-install.php
+          php -l scripts/build-distribution.php
+          bash tests/distribution.sh
+          bash tests/smoke.sh
+          bash tests/bundled.sh
+          php -d disable_functions=curl_init tests/tracking.php
