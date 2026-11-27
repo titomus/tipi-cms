@@ -1,4 +1,16 @@
-# Tipi CMS 0.6 preview
+# Tipi CMS 0.9.1 preview
+
+## Distribution navigateur (candidat au lancement)
+
+Le membre télécharge son fichier personnalisé depuis le Hub, le dépose dans la racine d'un domaine neuf via le gestionnaire de fichiers, ouvre `/tipi-install.php` et indique la clé fournie, le nom et le mot de passe. Aucun terminal chez le membre. PHP 8.2+, DOM, mbstring, sessions, HTTPS, droits d'écriture privés hors racine HTTP et Apache/rewrite (ou équivalent préconfiguré). cURL pour le Tipi ; PDO SQLite pour l'assistant IA facultatif. Les sous-dossiers URL et les hébergements sans stockage privé ne sont pas pris en charge.
+
+Le paquet est construit par le mainteneur, pas par le membre : `php scripts/build-distribution.php /chemin/prive/tipi-install-template.txt`. Pour activer les mises à jour, définir `TIPI_CMS_SIGNING_KEY` sur un fichier RSA privé d'au moins 2048 bits, hors dépôts et hors web. Le générateur embarque la clé publique et produit un compagnon `.release.json` signé. Ne jamais distribuer la clé privée. Publier uniquement les artefacts testés dans le Hub, avec leurs SHA-256 épinglés et le feature flag activé.
+
+L'assistant IA optionnel est placé dans le stockage privé par installation et initialisé en lecture seule ; les anciennes installations gardent leur organisation. L'administration Maintenance permet un export éditorial, une mise à jour du noyau signée et un retour à la version précédente si l'administration est accessible. Les changements de paquet CodeGraft sur un site déjà équipé sont refusés jusqu'à une migration dédiée. L'export éditorial ne constitue pas une sauvegarde intégrale et sa restauration automatique n'est pas encore implémentée.
+
+Tests : `bash tests/distribution.sh`, `bash tests/smoke.sh`, `bash tests/bundled.sh`, `php -d disable_functions=curl_init tests/tracking.php`. Une validation HTTPS et Apache/LiteSpeed sur hébergement réel reste obligatoire avant ouverture.
+
+Les instructions historiques ci-dessous concernent les installations techniques ou existantes.
 
 PHP 8.2+, CMS flat-file inspiré du Mini CMS Oncle Web. Sans BDD, sans Composer sur le serveur. Version de test, pas encore destinée à la production.
 
