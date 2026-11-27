@@ -5,6 +5,7 @@ trap 'rm -rf "$ROOT"' EXIT
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$ROOT/signing.pem" 2>/dev/null
 TIPI_CMS_SIGNING_KEY="$ROOT/signing.pem" php scripts/build-distribution.php "$ROOT/template.php"
 php -l "$ROOT/template.php"
+for site in one two; do
 php -r '
 define("TIPI_LIBRARY_ONLY",true);
 require $argv[1];
@@ -16,7 +17,7 @@ $bad=json_decode(file_get_contents($argv[1].".release.json"),true);
 $bad["signature"]=base64_encode("invalid");
 $refused=false;try{tipiVerifyCoreRelease(json_encode($bad));}catch(RuntimeException $e){$refused=true;}
 check($refused,"invalid signature refused");
-foreach(["one","two"] as $site){
+foreach([$argv[3]] as $site){
     $d=$argv[2]."/".$site;mkdir($d,0700);
     jwrite($d."/config.json",["runtime_layout"=>"private"]);
     check(tipiRuntimeRoot($d)===$d."/runtime","no sibling fallback");
@@ -30,8 +31,9 @@ foreach(["one","two"] as $site){
     $refused=false;try{tipiInstallBundledRuntime($d,"https://".$site.".example.test");}catch(RuntimeException $e){$refused=true;}
     check($refused,"no overwrite");
 }
-echo "Signed distribution and two isolated runtimes OK\n";
-' "$ROOT/template.php" "$ROOT"
+echo "Signed distribution and isolated runtime OK\n";
+' "$ROOT/template.php" "$ROOT" "$site"
+done
 
 mkdir "$ROOT/update-public" "$ROOT/update-private"
 cp "$ROOT/template.php" "$ROOT/update-public/index.php"
