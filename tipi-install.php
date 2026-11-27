@@ -345,7 +345,7 @@ final class MiniMarkdown {
   }
 }
 
-const TIPI_VERSION = '0.9.0-preview';
+const TIPI_VERSION = '0.9.1-preview';
 const TIPI_SETUP_HASH = '';
 const TIPI_BUNDLE_B64 = ''; // Populated by the distribution builder.
 const TIPI_RELEASE_PUBLIC_KEY_B64 = ''; // Pinned by the release builder.
@@ -1262,6 +1262,22 @@ function tipiRuntimeRoot(string $d): string {
     if(($cfg['runtime_layout']??'')==='private' || (!is_link($root)&&is_file($root.'/tipi-system/codegraft/standalone/config.php')))return $root;
     return dirname(__DIR__);
 }
+function tipiSetupHtaccess(): ?string {
+    $path=__DIR__.'/.htaccess';
+    if(is_link($path))fail('Fichier .htaccess symbolique interdit',409);
+    if(!file_exists($path))return null;
+    if(!is_file($path)||!is_readable($path)||filesize($path)>8192)fail('Fichier .htaccess existant non modifiable',409);
+    $old=file_get_contents($path);
+    if(!is_string($old)||preg_match('~^(?!\s*(?:#|$)).+~m',$old))fail('Le dossier contient déjà des règles .htaccess : utilisez un domaine neuf',409);
+    return $old;
+}
+function tipiSetupEmptyRoot(): bool {
+    foreach(new FilesystemIterator(__DIR__,FilesystemIterator::SKIP_DOTS) as $f){
+        if(in_array($f->getFilename(),[basename(__FILE__),'.htaccess','.well-known','cgi-bin','.user.ini','php.ini'],true))continue;
+        return false;
+    }
+    try{tipiSetupHtaccess();return true;}catch(Throwable $e){return false;}
+}
 function tipiSetupChecks(string $d): array {
     $parent=$d;
     while(!file_exists($parent)&&dirname($parent)!==$parent)$parent=dirname($parent);
@@ -1270,7 +1286,9 @@ function tipiSetupChecks(string $d): array {
     return ['PHP 8.2 minimum'=>PHP_VERSION_ID>=80200,'DOM / libxml'=>class_exists(DOMDocument::class),
         'mbstring'=>function_exists('mb_strtolower'),'Sessions PHP'=>function_exists('session_start'),
         'HTTPS (sauf test local)'=>$https||$local,'Racine du site accessible en écriture'=>is_writable(__DIR__),
-        'Stockage privé accessible en écriture'=>is_dir($parent)&&is_writable($parent)];
+        'Stockage privé accessible en écriture'=>is_dir($parent)&&is_writable($parent),
+        'Domaine ou sous-domaine dédié'=>realpath((string)($_SERVER['DOCUMENT_ROOT']??''))===realpath(__DIR__),
+        'Dossier sans site existant'=>tipiSetupEmptyRoot()];
 }
 function tipiRemoveNewTree(string $dir): void {
     if(is_link($dir)||!is_dir($dir))return;
@@ -1328,12 +1346,13 @@ function setup(string $d): void {
         $name=trim((string)($_POST['name']??'')); if($name===''||strlen($name)>120||preg_match('~[\r\n\x00]~',$name))fail('Nom de site invalide');
         $url=siteurl(trim((string)($_POST['url']??'')));
         if (basename(__FILE__)!=='index.php' && file_exists(__DIR__.'/index.php')) fail('index.php existe déjà : utilisez un dossier vide',409);
-        if (file_exists(__DIR__.'/.htaccess')) fail('.htaccess existe déjà : utilisez un dossier vide',409);
+        $oldHtaccess=tipiSetupHtaccess();
         if(!is_dir($d)&&!mkdir($d,0700,true)&&!is_dir($d))fail('Impossible de créer le stockage privé',500);
         $withAi=isset($_POST['with_ai']);
         if($withAi&&TIPI_BUNDLE_B64==='')fail('Assistant IA absent de ce paquet',422);
-        locked($d,function()use($d,$name,$url,$pw,$withAi){
+        locked($d,function()use($d,$name,$url,$pw,$withAi,$oldHtaccess){
             if(is_file($d.'/config.json'))fail('Déjà installé',409);
+            if(!tipiSetupEmptyRoot()||tipiSetupHtaccess()!==$oldHtaccess)fail('Le dossier du site a changé',409);
             atomic($d.'/.htaccess',"Require all denied\n");
             $seed=['home'=>rawDoc($name,"# ".$name."\n\nBienvenue sur votre nouveau site. Modifiez cette page dans l’administration.\n\n## Derniers articles\n\n{{list:blog}}\n"),'blog'=>rawDoc('Blog',"# Blog\n\n{{list:blog}}\n",['nav'=>'10']),'blog/bienvenue'=>rawDoc('Bienvenue',"# Bienvenue\n\nVotre premier article est prêt. Vous pouvez le modifier depuis le panneau d’administration.\n",['description'=>'Découvrez votre nouveau site.','author'=>'Équipe éditoriale'])];
             foreach($seed as $slug=>$raw){[$m,$b]=front($raw);$m['id']=bin2hex(random_bytes(12));$m['published_at']=gmdate(DATE_ATOM);writeDoc($d,$slug,'published',encodeDoc($m,$b));}
@@ -1345,14 +1364,14 @@ function setup(string $d): void {
                 if(file_exists(__DIR__.'/index.php')) fail('index.php existe déjà',409);
                 atomic(__DIR__.'/index.php',$source); $createdIndex=true; chmod(__DIR__.'/index.php',0644);
             }
-            if(file_exists(__DIR__.'/.htaccess')) fail('.htaccess existe déjà',409);
+            if(tipiSetupHtaccess()!==$oldHtaccess)fail('.htaccess a changé',409);
             atomic(__DIR__.'/.htaccess',"Options -Indexes\nDirectoryIndex index.php\nRewriteEngine On\nRewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]\nRewriteRule ^index\.php$ - [L]\nRewriteRule ^tipi-install[^/]*\.php$ - [F,L]\nRewriteRule ^ index.php [L,QSA]\n");
             $createdHtaccess=true; chmod(__DIR__.'/.htaccess',0644);
             if($withAi){tipiInstallBundledRuntime($d,$url);$createdRuntime=true;}
             jwrite($d.'/config.json',['name'=>$name,'url'=>$url,'password_hash'=>password_hash($pw,PASSWORD_DEFAULT),'api_hash'=>'','api_publish'=>false,'version'=>TIPI_VERSION,'runtime_layout'=>'private']);
             } catch(Throwable $error) {
                 if($createdRuntime){tipiRemoveNewTree($d.'/runtime');tipiRemoveNewTree($d.'/runtime-vault');}
-                if($createdHtaccess) @unlink(__DIR__.'/.htaccess');
+                if($createdHtaccess){if($oldHtaccess===null)@unlink(__DIR__.'/.htaccess');else{atomic(__DIR__.'/.htaccess',$oldHtaccess);chmod(__DIR__.'/.htaccess',0644);}}
                 if($createdIndex) @unlink(__DIR__.'/index.php');
                 throw $error;
             }
